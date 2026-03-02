@@ -1,24 +1,22 @@
 import os
 import time
 import cv2
-import numpy as np
 from ultralytics import YOLO
 import pandas as pd
-from ultralytics.utils.plotting import Annotator
 
 
 
 # 1. Загружаем модель
-pose_model = YOLO('yolo11n-pose.pt')
+pose_model = YOLO('yolo11s-pose.pt')
 model = YOLO('yolo11x.engine', task='detect')
 
 
-video_path = "test3.mp4"
+video_path = "test7.mp4"
 cap = cv2.VideoCapture(video_path)
 fps = cap.get(cv2.CAP_PROP_FPS)
 
 #обрезка ненужных кадров
-target_fps = 15
+target_fps = 3
 
 frame_skip = int(fps / target_fps)
 if frame_skip < 1:
@@ -33,7 +31,7 @@ if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
 last_save_per_student = {}
-COOLDOWN_SECONDS = 1
+COOLDOWN_SECONDS = 3
 
 phone_frames_counter = {}
 TEMPORAL_THRESHOLD = 5
@@ -46,29 +44,27 @@ print("Начинаю анализ... Нажмите 'q' для выхода.")
 
 
 def get_pose_status(keypoints_data, person_box):
-    """
-    Проверяет, наклонена ли голова студента слишком низко.
-    keypoints_data: тензор ключевых точек от YOLO Pose
-    """
-    if keypoints_data is None or len(keypoints_data.xy[0]) < 7:
-        return "Normal", (0, 255, 0)
-
     pts = keypoints_data.xy[0].cpu().numpy()
-    nose = pts[0]        # Нос
-    l_shoulder = pts[5]  # Левое плечо
-    r_shoulder = pts[6]  # Правое плечо
     conf = keypoints_data.conf[0].cpu().numpy()
-    if conf[0] < 0.5 or conf[5] < 0.5: # Если нос или плечо плохо видны
-        return "Normal", (0, 255, 0)
-    # Если точки не детектированы (нули), выходим
-    if nose[1] == 0 or l_shoulder[1] == 0:
+
+    # 0-нос, 5-л.плечо, 6-п.плечо, 11-л.бедро, 12-п.бедро
+    if conf[0] < 0.25 or conf[5] < 0.25 or conf[6] < 0.25:
         return "Normal", (0, 255, 0)
 
-    shoulder_y_avg = (l_shoulder[1] + r_shoulder[1]) / 2
+    nose = pts[0]
+    shoulder_mid = (pts[5] + pts[6]) / 2
 
-    # ЛОГИКА: Если нос ниже линии плеч на 5 пикселей (наклон к телефону на коленях)
-    if nose[1] > shoulder_y_avg + 5:
-        return "SUSPICIOUS POSE", (0, 0, 255)
+    # Считаем вектор "шеи"
+    neck_vector = nose - shoulder_mid
+
+    # Если камера сверху (как в классе на фото), наклон — это увеличение длины вектора шеи
+    # Если камера прямо — наклон это изменение координаты Y.
+    # Универсальный способ: нормализованное расстояние
+    person_height = abs(person_box[3] - person_box[1])
+    neck_ratio = (nose[1] - shoulder_mid[1]) / person_height
+
+    if neck_ratio > 0.08: # Коэффициент подбирается один раз под ракурс
+        return "SUSPICIOUS", (0, 0, 255)
 
     return "Normal", (0, 255, 0)
 
@@ -98,7 +94,15 @@ while cap.isOpened():
     verbose=False
     )
     # 2. Детекция поз (Скелеты) - запускаем на всем кадре
-    pose_results = pose_model(frame, imgsz=640, verbose=False, conf=0.3)
+    pose_results = pose_model(source=frame,
+    imgsz=1280,      # RTX 5070 легко потянет 1280 для Pose
+    conf=0.1,       # Ищем даже слабые скелеты
+    iou=0.45,        # Чтобы скелеты не слипались в один
+    augment=False,   # Оставляем False для FPS
+    stream=True,
+    half=True,
+    verbose=False
+    )
 
     current_persons = {}
     phones = []
@@ -117,35 +121,49 @@ while cap.isOpened():
     # Анализ поз (сопоставляем скелеты с нашими ID студентов)
     pose_statuses = {}
     suspicious_kpts = []
-    if pose_results[0].keypoints is not None and len(pose_results[0].keypoints) > 0:
+    for result in pose_results:
+        if result.keypoints is not None and len(result.keypoints) > 0:
 
-        # Создаем аннотатор
-        annotator = Annotator(frame, line_width=2)
+            # Создаем аннотатор
 
-        # Перебираем ВСЕ найденные скелеты БЕЗ привязки к ID для теста
-        for kpts in pose_results[0].keypoints:
-            # Получаем координаты носа в формате [x, y]
-            nk = kpts.xy[0][0].cpu().numpy()
+            # Перебираем ВСЕ найденные скелеты БЕЗ привязки к ID для теста
+           for kpts in result.keypoints:
+                d = kpts.data[0].cpu().numpy() # [17, 3]
+                nk = kpts.xy[0][0].cpu().numpy()
 
-            # Если координаты не нулевые, рисуем скелет ВСЕГДА
-            if nk[0] > 0 and nk[1] > 0:
-                # Рисуем скелет стандартным методом
-                annotator.kpts(kpts.data[0])
 
-                # Привязка статуса к ID (оставляем для логики)
+
+                # проверка на наличии точек внутри бокса yolo, если есть, то точки рисуються
+                is_real_person = False
+                nose_p = kpts.xy[0][0].cpu().numpy()
+
                 for s_id, s_box in current_persons.items():
-                    if s_box[0] < nk[0] < s_box[2] and s_box[1] < nk[1] < s_box[3]:
-                        status, color = get_pose_status(kpts, s_box)
-                        pose_statuses[s_id] = (status, color)
+                    # Если нос скелета внутри бокса студента от основной модели
+                    if s_box[0] < nose_p[0] < s_box[2] and s_box[1] < nose_p[1] < s_box[3]:
+                        is_real_person = True
+                        break
+
+                if not is_real_person:
+                    continue # Игнорируем скелет, если под ним нет "тела" по мнению детектора
+
+                for i in range(len(d)):
+                    x, y, c = d[i]
+                    if c > 0.1: # Рисуем только уверенные точки
+                        cv2.circle(frame, (int(x), int(y)), 2, (0, 255, 255), -1)
+
+                    # Привязка статуса к ID (оставляем для логики)
+                    for s_id, s_box in current_persons.items():
+                        if s_box[0] < nk[0] < s_box[2] and s_box[1] < nk[1] < s_box[3]:
+                            status, color = get_pose_status(kpts, s_box)
+                            pose_statuses[s_id] = (status, color)
 
         # Перезаписываем кадр результатом аннотатора
-        frame = annotator.result()
     for student_id, p_box in current_persons.items():
         px1, py1, px2, py2 = p_box
         p_status, p_color = pose_statuses.get(student_id, ("Normal", (0, 255, 0)))
-        cv2.rectangle(frame, (px1, py1), (px2, py2), p_color, 2)
-        cv2.putText(frame, f"ID {student_id} {p_status}", (px1, py1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, p_color, 2)
+        #cv2.rectangle(frame, (px1, py1), (px2, py2), p_color, 2)
+        #cv2.putText(frame, f"ID {student_id} {p_status}", (px1, py1 - 10),
+                   #  cv2.FONT_HERSHEY_SIMPLEX, 0.6, p_color, 2)
         # Сначала проверяем кулдаун (30 сек)
         if student_id in last_save_per_student:
             if current_time_seconds - last_save_per_student[student_id] < COOLDOWN_SECONDS:
