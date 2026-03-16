@@ -12,7 +12,6 @@ import cv2
 from newArch import ProctoringEngine
 
 r = redis.Redis(host='localhost', port=6379)
-keys = r.keys("camera:*")
 engine =  ProctoringEngine()
 r.flushall()
 print("Worker started. Processing batches...")
@@ -22,43 +21,59 @@ def decode_img(img_bytes):
     nparr = np.frombuffer(img_bytes, np.uint8)
     return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 executor = ThreadPoolExecutor(max_workers=8)
+QUEUE_NAME = "image_batch_queue" # Договорись с продюсерами, чтобы они делали r.lpush(QUEUE_NAME, img_bytes)
+MAX_BATCH_SIZE = 64
+
 while True:
-    start_time = time.time()
+    t_start = time.time()
 
-    # 1. Быстро собираем байты из Redis и СРАЗУ удаляем их (LIFO/Zero-latency)
-    raw_data = []
-    active_cam_ids = []
+    # --- Шаг 1: Забор из Redis ---
+    pipe = r.pipeline()
+    pipe.lrange(QUEUE_NAME, 0, -1)
+    pipe.delete(QUEUE_NAME)
+    results = pipe.execute()
 
-    for key in keys:
-        img_bytes = r.get(key)
-        if img_bytes:
-            r.delete(key) # Гарантируем отсутствие очереди
-            raw_data.append(img_bytes)
-            active_cam_ids.append(key)
+    all_data = results[0]
+    t_after_redis = time.time()
 
-    if not raw_data:
-        continue # Ждем данные, если пусто
+    if not all_data:
+        time.sleep(0.005)
+        continue
 
-    # 2. Параллельное декодирование (CPU Multithreading)
-    # Это "схлопывает" время декодирования 16-64 камер
+    # Берем срез, чтобы не перегружать CPU (можешь менять 64 на 16 или 32 для теста)
+    raw_data = all_data[:64]
+
+    # --- Шаг 2: Декодирование картинок (CPU) ---
     frames_for_engine = list(executor.map(decode_img, raw_data))
-
-    # Очищаем от None (если imdecode не справился)
     frames_for_engine = [f for f in frames_for_engine if f is not None]
+    t_after_decode = time.time()
 
-    if frames_for_engine:
-        # 3. Пакетная обработка (GPU Inference)
-        processed_frames, detections = engine.process_batch(frames_for_engine)
+    if not frames_for_engine:
+        continue
 
-        # 4. Сохранение результатов (JPEG encoding можно тоже в ThreadPool, если будет тормозить)
-        # for i, cam_id in enumerate(active_cam_ids):
-        #     # Ставим качество 60-80 для экономии ресурсов
-        #     _, buffer = cv2.imencode('.jpg', processed_frames[i], [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        #     r.set(f"result:{cam_id}", buffer.tobytes())
+    # --- Шаг 3: Нейронка (GPU Inference + Postprocess) ---
+    # ВАЖНО: убедись, что внутри process_batch нет лишних time.sleep или принтов
+    processed_frames, detections = engine.process_batch(frames_for_engine)
+    t_after_gpu = time.time()
 
-        # Статистика
-        total_time = time.time() - start_time
-        fps = len(frames_for_engine) / total_time
-        latency_ms = total_time * 1000
+    # --- Расчет таймингов ---
+    total_time = t_after_gpu - t_start
 
-        print(f"Batch: {len(frames_for_engine)} | System FPS: {fps:.2f} | Latency: {latency_ms:.1f}ms   ", end='\r')
+    # Сколько мс занял каждый этап:
+    redis_ms = (t_after_redis - t_start) * 1000
+    decode_ms = (t_after_decode - t_after_redis) * 1000
+    gpu_ms = (t_after_gpu - t_after_decode) * 1000
+    total_ms = total_time * 1000
+
+    fps = len(frames_for_engine) / total_time
+
+    # Вывод подробной статистики
+    stats = (
+        f"Batch: {len(frames_for_engine)} | "
+        f"Redis: {redis_ms:4.1f}ms | "
+        f"Decode: {decode_ms:4.1f}ms | "
+        f"GPU: {gpu_ms:4.1f}ms | "
+        f"Total: {total_ms:5.1f}ms | "
+        f"FPS: {fps:5.2f}"
+    )
+    print(stats, end='\r')
