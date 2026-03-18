@@ -4,15 +4,15 @@ import os
 from ultralytics import YOLO
 # model_det = YOLO('yolo11m.pt') # или твой путь к .pt
 # model_det.export(format='engine', device=0, imgsz=960, half=True, batch=8, dynamic=True)
-# #
-# ## Для модели поз (Pose) — ОБЯЗАТЕЛЬНО тоже в .engine!
-# model_pose = YOLO('yolo11m-pose.pt')
-# model_pose.export(format='engine', device=0, imgsz=960, half=True, batch=8, dynamic=True)
+#
+## Для модели поз (Pose) — ОБЯЗАТЕЛЬНО тоже в .engine!
+model_pose = YOLO('yolo11m-pose.pt')
+model_pose.export(format='engine', device=0, imgsz=640, half=True, batch=16, dynamic=True)
 
 class ProctoringEngine:
-    def __init__(self, model_path='models/yolo11m8960.engine', pose_path='models/yolo11m-pose8960.engine'):
+    def __init__(self, model_path='models/yolo11m4960.engine', pose_path='models/yolo11m-pose16640.engine'):
         # Загружаем модели
-        self.model = YOLO(model_path, task='detect')
+        #self.model = YOLO(model_path, task='detect')
         self.pose_model = YOLO(pose_path)
 
         # Настройки папок
@@ -27,6 +27,10 @@ class ProctoringEngine:
         self.threshold = 3 # TEMPORAL_THRESHOLD
         self.detections = [] # Список для вывода в таблицу
 
+        #stats
+        self.frameCount = 0
+        self.peopleAVG = 0
+        self.peopleMax = 0
     def get_pose_status(self, kpts_data, box):
         pts = kpts_data.xy[0].cpu().numpy()
         conf = kpts_data.conf[0].cpu().numpy()
@@ -42,56 +46,75 @@ class ProctoringEngine:
         if not frames or any(f is None for f in frames):
             return frames
         current_time = time.time()
+        MAX_BATCH = 16
+        all_results = []
+        all_pose_results = []
         display_time = time.strftime("%H:%M:%S")
         stream_ids = list(range(len(frames)))
         # 1. Пакетный инференс (RTX 5070 обработает frames параллельно)
         # Важно: imgsz=640 сильно ускорит процесс без потери качества для телефонов
-        # 2. Передаем их в трекер
-        results = self.model.track(
-        source=frames,
-        imgsz=960,
-        half=True,
-        conf=0.4,
-        verbose=False,
-    )
+        for i in range(0, len(frames), MAX_BATCH):
+            micro_batch = frames[i : i + MAX_BATCH]
 
-        pose_results = self.pose_model.track(source=frames,
-    persist=True,
-    conf=0.05,      # Позволь трекеру видеть "слабые" скелеты
-    iou=0.5,       # Поможет не склеивать детей, сидящих рядом
-    imgsz=960,
-    half=True,
-    tracker="bytetrack.yaml",
-    verbose=True,
-    )
+            # Инференс детекции
+            # res = self.model.track(
+            #     source=micro_batch,
+            #     imgsz=640,
+            #     half=True,
+            #     conf=0.4,
+            #     verbose=False,
+            # )
+            # all_results.extend(res) # Собираем результаты в один список
+
+            # Инференс поз
+            pose_results = self.pose_model.track(
+                source=micro_batch,
+                persist=True,
+                conf=0.05,      # Позволь трекеру видеть "слабые" скелеты
+                iou=0.5,       # Поможет не склеивать детей, сидящих рядом
+                imgsz=640,
+                half=True,
+                tracker="bytetrack.yaml",
+                verbose=True,
+            )
+            all_pose_results.extend(pose_results)
+
 
         processed_output = []
 
         # 2. Итерируемся по кадрам и ИХ СООТВЕТСТВУЮЩИМ результатам
         for i, frame in enumerate(frames):
             # БЕРЕМ РЕЗУЛЬТАТ ИМЕННО ДЛЯ ТЕКУЩЕГО КАДРА [i]
-            res = results[i]
-            pose_res = pose_results[i]
+            # res = all_results[i]
+            pose_res = all_pose_results[i]
 
             current_persons = {}
             phones = []
 
-            if res.boxes.id is not None:
-                ids = res.boxes.id.int().tolist()
-                cls = res.boxes.cls.int().tolist()
-                boxes = res.boxes.xyxy.int().tolist()
-                for obj_id, obj_cls, box in zip(ids, cls, boxes):
-                    # Добавляем префикс камеры (например, 1001, 2001)
-                    unique_id = obj_id + (i + 1) * 1000
-
-                    if obj_cls == 0:
-                        current_persons[unique_id] = box
-                    elif obj_cls == 67:
-                        phones.append(box)
+            # if res.boxes.id is not None:
+            #     ids = res.boxes.id.int().tolist()
+            #     cls = res.boxes.cls.int().tolist()
+            #     boxes = res.boxes.xyxy.int().tolist()
+            #     for obj_id, obj_cls, box in zip(ids, cls, boxes):
+            #         # Добавляем префикс камеры (например, 1001, 2001)
+            #         unique_id = obj_id + (i + 1) * 1000
+            #
+            #         if obj_cls == 0:
+            #             current_persons[unique_id] = box
+            #         elif obj_cls == 67:
+            #             phones.append(box)
 
             # 3. Обработка поз для конкретного кадра
             pose_statuses = {}
             if pose_res.keypoints is not None:
+                self.frameCount += 1
+                # Считаем, сколько людей именно В ЭТОМ кадре
+                people_in_current_frame = len(pose_res.keypoints)
+
+                # Обновляем среднее: (старое_среднее * кол-во_прошлых_кадров + люди_сейчас) / новый_счетчик
+                self.peopleAVG = (self.peopleAVG * (self.frameCount - 1) + people_in_current_frame) / self.frameCount
+                if self.peopleMax < self.peopleAVG:
+                    self.peopleMax = self.peopleAVG
                 # В YOLO Pose результаты для нескольких людей лежат в .keypoints
                 for kpts in pose_res.keypoints:
                     # Проверяем уверенность детекции ключевых точек
@@ -100,7 +123,8 @@ class ProctoringEngine:
                                 x, y, c = pt
                                 if c > 0.3: cv2.circle(frame, (int(x), int(y)), 2, (0, 255, 255), -1)
                     nose_p = kpts.xy[0][0].cpu().numpy()
-
+            if self.frameCount % 100 == 0:
+                print(f"Stats: AVG: {self.peopleAVG:.2f} | MAX - {self.peopleMax}| Frames: {self.frameCount}")
             # 4. Основная логика нарушений
             for s_id, p_box in current_persons.items():
                 status, color = pose_statuses.get(s_id, ("Normal", (0, 255, 0)))

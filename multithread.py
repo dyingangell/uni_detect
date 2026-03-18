@@ -1,13 +1,19 @@
 import os
+import sys
+import time
+import threading
+import json
+import base64
+
 gst_bin_path = r'D:\program\msvc_x86_64\bin'
 
 if os.path.exists(gst_bin_path):
     os.add_dll_directory(gst_bin_path)
+
 import cv2
 import redis
-import threading
-import time
-import sys
+
+
 def camera_worker(cam_id, video_file):
     # Убираем проверку GStreamer DLL для этого теста, используем стандартный OpenCV
     r = redis.Redis(host='localhost', port=6379)
@@ -37,14 +43,20 @@ def camera_worker(cam_id, video_file):
 
         # Кодируем в JPEG
         _, img_encoded = cv2.imencode('.jpg', frame_resized)
-        r.lpush("image_batch_queue", img_encoded.tobytes()) # Тут должен быть img_encoded!
-        r.ltrim("image_batch_queue", 0, 100)
+
+        payload = {
+            "cam_id": cam_id,
+            "img": base64.b64encode(img_encoded.tobytes()).decode("ascii"),
+        }
+        r.lpush("image_batch_queue", json.dumps(payload))
+        r.ltrim("image_batch_queue", 0, 1000)
 
         # Контроль FPS (25 кадров)
-        time.sleep(0.04)
+        time.sleep(0.2)
+
 
 if __name__ == "__main__":
-    folder_num = int(sys.argv[1]) # Например, 1, 2, 3 или 4
+    folder_num = int(sys.argv[1])  # Например, 1, 2, 3 или 4
 
     threads = []
     for i in range(1, 9):
@@ -67,6 +79,7 @@ if __name__ == "__main__":
 
     print(f"Запущено {len(threads)} камер. Нажми Ctrl+C для выхода.")
     try:
-        while True: time.sleep(1)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("Остановка...")

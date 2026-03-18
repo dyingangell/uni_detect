@@ -9,7 +9,7 @@ import cv2
 st.set_page_config(layout="wide")
 
 frame_count = 0
-SKIP_FRAMES = 2  # Обрабатываем каждый 3-й кадр (инференс 1 раз, затем 2 раза пропуск)
+SKIP_FRAMES = 1  # Обрабатываем каждый 3-й кадр (инференс 1 раз, затем 2 раза пропуск)
 last_processed_frames = None
 
 # 1. Загрузка движка
@@ -82,7 +82,7 @@ class VideoStream:
             self.cap.release()
 
 # --- ИНТЕРФЕЙС ---
-sources = ["test.mp4", "test6.mp4","test4.mp4", "test7.mp4", "test2.mp4", "test3.mp4", "test5.mp4", 0]
+sources = ["video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4"]
 
 # Используем checkbox вместо button для бесконечных процессов в Streamlit
 run_watch = st.sidebar.checkbox("ЗАПУСТИТЬ МОНИТОРИНГ")
@@ -106,7 +106,7 @@ if run_watch:
                 if f is not None:
                     raw_frames.append(f)
 
-            if len(raw_frames) > 0:
+            if len(raw_frames) > 15:
                 # 1. ЛОГИКА ПРОПУСКА КАДРОВ
                 if frame_count % SKIP_FRAMES == 0:
                     # Выполняем инференс

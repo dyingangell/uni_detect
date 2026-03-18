@@ -3,7 +3,7 @@ import sys
 import time
 
 # Настройки теста
-NUM_CAMERAS = 16  # Попробуй сначала 20, потом увеличивай до 100
+NUM_CAMERAS = 32  # Попробуй сначала 20, потом увеличивай до 100
 VIDEO_PATH = "video/test7.mp4" # Путь к твоему тестовому файлу
 PRODUCER_SCRIPT = "producer.py"
 PYTHON_EXE = sys.executable

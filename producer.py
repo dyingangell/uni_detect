@@ -49,7 +49,9 @@ def start_producer(cam_id, source):
         # Записываем в Redis
         # frame уже 640x640 благодаря GStreamer pipeline, resize() в Python больше не нужен!
         _, img_encoded = cv2.imencode('.jpg', frame)
-        r.set(f"camera:{cam_id}", img_encoded.tobytes())
+        r.lpush("image_batch_queue", img_encoded.tobytes()) # Тут должен быть img_encoded!
+        r.ltrim("image_batch_queue", 0, 100)
+        print(f"[{cam_id}] Frame sent to Redis") # Добавь для проверки
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
