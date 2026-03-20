@@ -41,12 +41,26 @@ while True:
 
     idx = meta["idx"]
     cam_id = str(meta["cid"])
+    warn_text = meta.get("warn", "") or ""
+    pose_score = meta.get("pose_score", None)
 
     # Восстановление тензоров при необходимости
     boxes = np.frombuffer(meta["box"], dtype=np.float16).reshape(meta["box_shape"])
     kpts = np.frombuffer(meta["kpt"], dtype=np.float16).reshape(meta["kpt_shape"])
 
     frame = shared_array[idx].copy()
+    if warn_text:
+        score_str = f"{float(pose_score):.1f}" if pose_score is not None else "?"
+        cv2.putText(
+            frame,
+            f"WARNING: {warn_text} (score={score_str})",
+            (12, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
     # kpts.shape: (num_people, num_points, 3) -> (x, y, conf)
     if kpts.size > 0:
         num_people = kpts.shape[0]

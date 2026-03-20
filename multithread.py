@@ -56,7 +56,21 @@ def camera_worker(cam_id, video_file):
 
 
 if __name__ == "__main__":
-    folder_num = int(sys.argv[1])  # Например, 1, 2, 3 или 4
+    if len(sys.argv) < 2:
+        print("Usage: python multithread.py <folder_num>")
+        print("Example: python multithread.py 1")
+        print("folder_num should be 1..8 (expects videos in video<folder_num>/test1.mp4 .. test8.mp4)")
+        raise SystemExit(2)
+
+    try:
+        folder_num = int(sys.argv[1])  # Например, 1, 2, 3 или 4
+    except ValueError:
+        print(f"[Ошибка] folder_num должен быть числом, получено: {sys.argv[1]!r}")
+        raise SystemExit(2)
+
+    if folder_num < 1 or folder_num > 8:
+        print(f"[Ошибка] folder_num вне диапазона 1..8, получено: {folder_num}")
+        raise SystemExit(2)
 
     threads = []
     for i in range(1, 9):

@@ -7,5 +7,9 @@ HOW TO START TS
 тут видно 8 папок, это для эмулирования 
 6) python worker.py просто запускаешь, он работает в любом случаи, остальное сам дебаж чмо 
 
+Desktop UI:
+- python desktop_viewer.py  (окно с камерами + warnings)
+- python warnings_window.py (отдельное окно со списком warnings, можно скроллить/фильтровать/экспортировать)
+
 
 

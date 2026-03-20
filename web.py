@@ -9,7 +9,7 @@ import cv2
 st.set_page_config(layout="wide")
 
 frame_count = 0
-SKIP_FRAMES = 1  # Обрабатываем каждый 3-й кадр (инференс 1 раз, затем 2 раза пропуск)
+SKIP_FRAMES = 2  # Обрабатываем каждый 3-й кадр (инференс 1 раз, затем 2 раза пропуск)
 last_processed_frames = None
 
 # 1. Загрузка движка

@@ -20,7 +20,7 @@ print("Worker started. Processing batches...")
 
 # settings
 QUEUE_NAME = "image_batch_queue"  # Продюсеры делают r.lpush(QUEUE_NAME, json)
-MAX_BATCH_SIZE = 64
+MAX_BATCH_SIZE = 16
 
 
 def decode_img(item_bytes):
@@ -81,8 +81,21 @@ def results_sender(results_queue, redis_host='localhost'):
 # --- ОСНОВНОЙ МЕНЕДЖЕР (DECODER) ---
 if __name__ == "__main__":
     r = redis.Redis(host='localhost', port=6379)
-    #очистка оперативки от старых кадров
-    r.flushall()
+    # Дружелюбная проверка Redis вместо падения трассировкой
+    try:
+        r.ping()
+    except Exception as e:
+        print("[Ошибка] Redis недоступен на localhost:6379.")
+        print("Запусти Redis и повтори. Если используешь Docker Desktop, пример:")
+        print('  docker run -d --name redis-stack -p 6379:6379 -p 8001:8001 redis/redis-stack:latest')
+        print(f"Детали: {e}")
+        raise SystemExit(2)
+
+    # очистка очередей/состояния (безопаснее чем FLUSHALL)
+    try:
+        r.delete(QUEUE_NAME, "raw_ai_results", "proctor_warnings")
+    except Exception:
+        pass
     executor = ThreadPoolExecutor(max_workers=8)
 
     # Очередь для передачи кадров в ИИ (храним не более 3 батчей, чтобы не забить RAM)
