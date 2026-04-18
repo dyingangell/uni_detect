@@ -8,7 +8,7 @@ import json
 
 class VisualizerWorker:
     def __init__(self, shm_name, frame_shape):
-        # Подключаемся к общей памяти
+        # Attach to the shared frame buffer
         self.shm = shared_memory.SharedMemory(name=shm_name)
         self.frame_buffer = np.ndarray(frame_shape, dtype=np.uint8, buffer=self.shm.buf)
 
@@ -20,33 +20,33 @@ class VisualizerWorker:
         self.cooldown = 5
 
     def run(self):
-        print("Визуализатор запущен...")
+        print("Visualizer started...")
         while True:
-            # Забираем только метаданные из Redis
+            # Pull one task from Redis (metadata only)
             data = self.r.lpop("visualize_queue")
             if not data:
                 time.sleep(0.01)
                 continue
 
             task = json.loads(data)
-            # Извлекаем данные (координаты уже посчитаны ИИ)
-            frame_idx = task['idx'] # Позиция кадра в Shared Memory
+            # Unpack payload fields (coordinates are already precomputed)
+            frame_idx = task['idx'] # Index of the frame in shared memory
             current_persons = task['persons']
             phones = task['phones']
             keypoints = task['keypoints']
             cam_id = task['cam_id']
 
-            # Ссылка на конкретный кадр в памяти
+            # Copy the target frame out of shared memory
             frame = self.frame_buffer[frame_idx].copy()
 
-            # 1. Рисуем скелеты (Keypoints)
+            # 1) Draw pose keypoints
             for kpt_set in keypoints:
                 for pt in kpt_set:
                     x, y, conf = pt
                     if conf > 0.3:
                         cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)
 
-            # 2. Логика телефонов
+            # 2) Check whether a phone is inside the student's ROI
             for s_id, p_box in current_persons.items():
                 phone_in_zone = False
                 for ph in phones:
@@ -57,22 +57,22 @@ class VisualizerWorker:
                         phone_in_zone = True
                         cv2.rectangle(frame, (ph[0], ph[1]), (ph[2], ph[3]), (0,0,255), 2)
 
-                # Обновляем счетчик
+                # Update per-student counter
                 cnt = self.phone_counters.get(s_id, 0)
                 self.phone_counters[s_id] = cnt + 1 if phone_in_zone else max(0, cnt - 1)
 
-                # Сохранение нарушения
+                # Save evidence frame when threshold is reached
                 if self.phone_counters[s_id] >= self.threshold:
                     cur_t = time.time()
                     if cur_t - self.last_save.get(s_id, 0) > self.cooldown:
                         fname = f"cam{cam_id}_id{s_id}_{int(cur_t)}.jpg"
                         cv2.imwrite(os.path.join(self.save_dir, fname), frame)
                         self.last_save[s_id] = cur_t
-                        print(f"!!! НАРУШЕНИЕ ЗАПИСАНО: {fname}")
+                        print(f"!!! VIOLATION SAVED: {fname}")
 
                     cv2.putText(frame, "PHONE!", (int(p_box[0]), int(p_box[3]+20)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
 
-            # (Опционально) Показать превью
+            # Optional local preview window
             cv2.imshow("Live Monitor", frame)
             cv2.waitKey(1)

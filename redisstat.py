@@ -7,10 +7,10 @@ try:
     while True:
         queue_len = r.llen("image_batch_queue")
         memory = r.info('memory')['used_memory_human']
-        print(f"--- Мониторинг Redis ---")
-        print(f"Кадров в очереди: {queue_len}")
-        print(f"Память занята: {memory}")
+        print(f"--- Redis Monitoring ---")
+        print(f"Frames in queue: {queue_len}")
+        print(f"Memory used: {memory}")
         print(f"------------------------")
         time.sleep(1)
 except KeyboardInterrupt:
-    print("Стоп")
+    print("Stopped")

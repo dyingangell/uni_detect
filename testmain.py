@@ -2,30 +2,30 @@ import cv2
 import time
 import os
 from ultralytics import YOLO
-# model_det = YOLO('yolo11m.pt') # или твой путь к .pt
+# model_det = YOLO('yolo11m.pt') # or your custom .pt path
 # model_det.export(format='engine', device=0, imgsz=960, half=True, batch=8, dynamic=True)
 #
-## Для модели поз (Pose) — ОБЯЗАТЕЛЬНО тоже в .engine!
+## For pose models, export to .engine as well (required).
 model_pose = YOLO('yolo11m-pose.pt')
 model_pose.export(format='engine', device=0, imgsz=640, half=True, batch=16, dynamic=True)
 
 class ProctoringEngine:
     def __init__(self, model_path='models/yolo11m4960.engine', pose_path='models/yolo11m-pose16640.engine'):
-        # Загружаем модели
+        # Load models
         #self.model = YOLO(model_path, task='detect')
         self.pose_model = YOLO(pose_path)
 
-        # Настройки папок
+        # Configure output directories
         self.save_dir = "evidence_folder"
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
-        # Словари для состояний
+        # State containers
         self.last_save = {}
         self.phone_counters = {}
         self.cooldown = 3
         self.threshold = 3 # TEMPORAL_THRESHOLD
-        self.detections = [] # Список для вывода в таблицу
+        self.detections = [] # Used for table/UI output
 
         #stats
         self.frameCount = 0
@@ -51,12 +51,12 @@ class ProctoringEngine:
         all_pose_results = []
         display_time = time.strftime("%H:%M:%S")
         stream_ids = list(range(len(frames)))
-        # 1. Пакетный инференс (RTX 5070 обработает frames параллельно)
-        # Важно: imgsz=640 сильно ускорит процесс без потери качества для телефонов
+        # 1. Batch inference (GPU processes frames in parallel)
+        # Note: imgsz=640 significantly improves throughput with minimal quality trade-off
         for i in range(0, len(frames), MAX_BATCH):
             micro_batch = frames[i : i + MAX_BATCH]
 
-            # Инференс детекции
+            # Detection inference
             # res = self.model.track(
             #     source=micro_batch,
             #     imgsz=640,
@@ -64,14 +64,14 @@ class ProctoringEngine:
             #     conf=0.4,
             #     verbose=False,
             # )
-            # all_results.extend(res) # Собираем результаты в один список
+            # all_results.extend(res) # Aggregate results into one list
 
-            # Инференс поз
+            # Pose inference
             pose_results = self.pose_model.track(
                 source=micro_batch,
                 persist=True,
-                conf=0.05,      # Позволь трекеру видеть "слабые" скелеты
-                iou=0.5,       # Поможет не склеивать детей, сидящих рядом
+                conf=0.05,      # Keep low-confidence skeletons for tracker stability
+                iou=0.5,       # Helps avoid merging nearby seated students
                 imgsz=640,
                 half=True,
                 tracker="bytetrack.yaml",
@@ -82,9 +82,9 @@ class ProctoringEngine:
 
         processed_output = []
 
-        # 2. Итерируемся по кадрам и ИХ СООТВЕТСТВУЮЩИМ результатам
+        # 2. Iterate through frames with their corresponding results
         for i, frame in enumerate(frames):
-            # БЕРЕМ РЕЗУЛЬТАТ ИМЕННО ДЛЯ ТЕКУЩЕГО КАДРА [i]
+            # Use the result that belongs to the current frame [i]
             # res = all_results[i]
             pose_res = all_pose_results[i]
 
@@ -96,7 +96,7 @@ class ProctoringEngine:
             #     cls = res.boxes.cls.int().tolist()
             #     boxes = res.boxes.xyxy.int().tolist()
             #     for obj_id, obj_cls, box in zip(ids, cls, boxes):
-            #         # Добавляем префикс камеры (например, 1001, 2001)
+            #         # Add camera prefix (e.g., 1001, 2001)
             #         unique_id = obj_id + (i + 1) * 1000
             #
             #         if obj_cls == 0:
@@ -104,20 +104,20 @@ class ProctoringEngine:
             #         elif obj_cls == 67:
             #             phones.append(box)
 
-            # 3. Обработка поз для конкретного кадра
+            # 3. Process poses for this specific frame
             pose_statuses = {}
             if pose_res.keypoints is not None:
                 self.frameCount += 1
-                # Считаем, сколько людей именно В ЭТОМ кадре
+                # Count people in this exact frame
                 people_in_current_frame = len(pose_res.keypoints)
 
-                # Обновляем среднее: (старое_среднее * кол-во_прошлых_кадров + люди_сейчас) / новый_счетчик
+                # Update running average: (prev_avg * prev_frames + people_now) / new_frame_count
                 self.peopleAVG = (self.peopleAVG * (self.frameCount - 1) + people_in_current_frame) / self.frameCount
                 if self.peopleMax < self.peopleAVG:
                     self.peopleMax = self.peopleAVG
-                # В YOLO Pose результаты для нескольких людей лежат в .keypoints
+                # YOLO Pose stores multi-person results in .keypoints
                 for kpts in pose_res.keypoints:
-                    # Проверяем уверенность детекции ключевых точек
+                    # Check keypoint detection confidence
                     if kpts.conf is None or kpts.conf[0][0] < 0.2: continue
                     for pt in kpts.data[0].cpu().numpy():
                                 x, y, c = pt
@@ -125,7 +125,7 @@ class ProctoringEngine:
                     nose_p = kpts.xy[0][0].cpu().numpy()
             if self.frameCount % 100 == 0:
                 print(f"Stats: AVG: {self.peopleAVG:.2f} | MAX - {self.peopleMax}| Frames: {self.frameCount}")
-            # 4. Основная логика нарушений
+            # 4. Main violation logic
             for s_id, p_box in current_persons.items():
                 status, color = pose_statuses.get(s_id, ("Normal", (0, 255, 0)))
                 # cv2.rectangle(frame, (p_box[0], p_box[1]), (p_box[2], p_box[3]), color, 2)
@@ -145,7 +145,7 @@ class ProctoringEngine:
                 self.phone_counters[s_id] = cnt + 1 if phone_in_zone else max(0, cnt - 1)
 
                 if self.phone_counters[s_id] >= self.threshold:
-                    # Логика сохранения (кулдаун)
+                    # Save logic with cooldown
                     if current_time - self.last_save.get(s_id, 0) > self.cooldown:
                         file_name = f"cheat_id{s_id}_{time.strftime('%H%M%S')}.jpg"
                         cv2.imwrite(os.path.join(self.save_dir, file_name), frame)

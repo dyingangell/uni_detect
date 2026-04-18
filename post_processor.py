@@ -12,7 +12,7 @@ import msgpack
 import time
 import streamlit as st
 
-# Подключаемся к той же памяти
+# Attach to the same shared memory buffer
 shm = shared_memory.SharedMemory(name="cv_frame_buffer")
 shared_array = np.ndarray((200, 640, 640, 3), dtype=np.uint8, buffer=shm.buf)
 r = redis.Redis(host='localhost', port=6379)
@@ -22,7 +22,7 @@ num_cams = 64
 cols = st.columns(4)
 cam_placeholders = {}
 
-print("Post-processor готов к работе...")
+print("Post-processor is ready...")
 for cam_id in range(1, num_cams + 1):
     col = cols[(cam_id - 1) % 4]
     with col:
@@ -44,7 +44,7 @@ while True:
     warn_text = meta.get("warn", "") or ""
     pose_score = meta.get("pose_score", None)
 
-    # Восстановление тензоров при необходимости
+    # Reconstruct tensors when present
     boxes = np.frombuffer(meta["box"], dtype=np.float16).reshape(meta["box_shape"])
     kpts = np.frombuffer(meta["kpt"], dtype=np.float16).reshape(meta["kpt_shape"])
 
@@ -65,24 +65,24 @@ while True:
     if kpts.size > 0:
         num_people = kpts.shape[0]
         num_joints = kpts.shape[1]
-        # Связи между точками (для линий) — пример для COCO-подобной разметки
+        # Keypoint links for skeleton lines (COCO-like layout)
         skeleton_pairs = [
-            (5, 6),  # плечи
-            (5, 7), (7, 9),  # левая рука
-            (6, 8), (8, 10), # правая рука
-            (11, 12),        # бёдра
+            (5, 6),  # shoulders
+            (5, 7), (7, 9),  # left arm
+            (6, 8), (8, 10), # right arm
+            (11, 12),        # hips
             (11, 13), (13, 15),
             (12, 14), (14, 16),
         ]
         for p in range(num_people):
             person_kpts = kpts[p]  # shape: (num_joints, 3)
-            # Точки
+            # Keypoints
             for j in range(num_joints):
                 x, y, conf = person_kpts[j]
                 if conf < 0.3:
                     continue
                 cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1)
-            # Линии между ключевыми точками
+            # Skeleton lines between keypoints
             for j1, j2 in skeleton_pairs:
                 if j1 >= num_joints or j2 >= num_joints:
                     continue

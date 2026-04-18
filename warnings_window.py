@@ -24,11 +24,18 @@ class WarningEvent:
     def from_payload(payload: str) -> "WarningEvent | None":
         try:
             obj = json.loads(payload)
+            print(f"[WARN_WINDOW] Received from Redis: {obj}")
+            wtype = str(obj.get("type", ""))
+            # Accept only dist_warning events
+            if wtype != "dist_warning":
+                print(f"[WARN_WINDOW] Skipping type: {wtype}")
+                return None
             ts = float(obj.get("ts", time.time()))
             cam_id = str(obj.get("cam_id", "unknown"))
-            wtype = str(obj.get("type", "warning"))
+            print(f"[WARN_WINDOW] ✅ Accepted dist_warning for camera {cam_id}")
             return WarningEvent(ts=ts, cam_id=cam_id, type=wtype)
-        except Exception:
+        except Exception as e:
+            print(f"[WARN_WINDOW] Parsing error: {e}")
             return None
 
     def pretty(self) -> str:
@@ -184,7 +191,7 @@ class WarningsApp:
         self.root.destroy()
 
     def _show_cheaters(self):
-        # Уникальные cam_id без повторов: берём последнее событие на камеру
+        # Unique cam_id list without duplicates: keep only the latest event per camera
         latest_by_cam: dict[str, WarningEvent] = {}
         for ev in self.events:
             if ev.cam_id == "system":

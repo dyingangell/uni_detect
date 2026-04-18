@@ -5,25 +5,25 @@ import numpy as np
 import streamlit as st
 import cv2
 
-# Настройка страницы
+# Page configuration
 st.set_page_config(layout="wide")
 
 frame_count = 0
-SKIP_FRAMES = 2  # Обрабатываем каждый 3-й кадр (инференс 1 раз, затем 2 раза пропуск)
+SKIP_FRAMES = 2  # Process every 3rd frame (1 inference run, then skip 2 frames)
 last_processed_frames = None
 
-# 1. Загрузка движка
+# 1. Engine initialization
 if 'engine' not in st.session_state:
-    with st.spinner("Загружаем TensorRT..."):
-        # Импортируем только здесь, чтобы ускорить запуск интерфейса
+    with st.spinner("Loading TensorRT..."):
+        # Import lazily here to speed up initial UI load
         from testmain import ProctoringEngine
         st.session_state.engine = ProctoringEngine()
-        st.success("Движок инициализирован!")
+        st.success("Engine initialized!")
 
 class VideoStream:
     def __init__(self, src):
         self.src = src
-        # Для чисел (камер) используем DSHOW, для файлов (строк) — авто
+        # Use DSHOW for numeric camera sources, default backend for file paths
         if isinstance(self.src, int):
             self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
         else:
@@ -32,15 +32,15 @@ class VideoStream:
         self.frame = None
         self.stopped = False
 
-        # Сначала создаем поток, чтобы .start() всегда мог к нему обратиться
+        # Create the thread first so .start() can always reference it
         self.t = threading.Thread(target=self.update, daemon=True)
 
         if not self.cap.isOpened():
-            st.error(f"Не удалось открыть источник: {src}")
+            st.error(f"Failed to open source: {src}")
             self.stopped = True
             return
 
-        # Настройка параметров (только для камер)
+        # Camera-only capture settings
         if isinstance(self.src, int):
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -51,7 +51,7 @@ class VideoStream:
         self.frame_delay = 1.0 / self.fps
 
     def start(self):
-        # Запускаем только если источник открыт успешно
+        # Start only when the source was opened successfully
         if not self.stopped:
             self.t.start()
         return self
@@ -62,10 +62,10 @@ class VideoStream:
             ret, frame = self.cap.read()
 
             if not ret:
-                if isinstance(self.src, str): # Зацикливаем видео
+                if isinstance(self.src, str): # Loop video input
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
-                else: # Камера отвалилась
+                else: # Camera source dropped
                     break
 
             self.frame = frame
@@ -81,11 +81,11 @@ class VideoStream:
         if self.cap.isOpened():
             self.cap.release()
 
-# --- ИНТЕРФЕЙС ---
+# --- UI ---
 sources = ["video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4","video/test7.mp4"]
 
-# Используем checkbox вместо button для бесконечных процессов в Streamlit
-run_watch = st.sidebar.checkbox("ЗАПУСТИТЬ МОНИТОРИНГ")
+# Use a checkbox instead of a button for long-running Streamlit loops
+run_watch = st.sidebar.checkbox("START MONITORING")
 
 if run_watch:
     if 'streams' not in st.session_state:
@@ -95,8 +95,7 @@ if run_watch:
     main_placeholder = st.empty()
 
 
-    # Чтобы цикл не вешал интерфейс в 2026 году,
-    # Streamlit рекомендует использовать небольшие паузы и явное обновление
+    # Keep the UI responsive: short sleeps plus explicit redraws
     try:
 
         while run_watch:
@@ -107,39 +106,39 @@ if run_watch:
                     raw_frames.append(f)
 
             if len(raw_frames) > 15:
-                # 1. ЛОГИКА ПРОПУСКА КАДРОВ
+                # 1. Frame skipping logic
                 if frame_count % SKIP_FRAMES == 0:
-                    # Выполняем инференс
+                    # Run inference
                     processed_frames, detections = st.session_state.engine.process_batch(raw_frames)
-                    # Ресайзим сразу после обработки
+                    # Resize right after processing
                     resized_frames = [cv2.resize(f, (640, 360)) for f in processed_frames]
 
-                    # 2. УНИВЕРСАЛЬНОЕ ПОСТРОЕНИЕ СЕТКИ (Grid)
+                    # 2. Generic grid layout
                     cols = 4 if len(resized_frames) > 4 else 2
                     rows = int(np.ceil(len(resized_frames) / cols))
 
                     h, w, c = resized_frames[0].shape
                     black_screen = np.zeros((h, w, c), dtype=np.uint8)
 
-                    # Заполняем пустые слоты, если камер, например, 7, а не 8
+                    # Fill empty slots (e.g., 7 cameras instead of 8)
                     all_slots = list(resized_frames)
                     while len(all_slots) < rows * cols:
                         all_slots.append(black_screen)
 
-                    # Склеиваем ряды
+                    # Stack rows into a final grid
                     grid_rows = [np.hstack(all_slots[i*cols : (i+1)*cols]) for i in range(rows)]
                     last_display_grid = np.vstack(grid_rows)
 
-                # 3. ВЫВОД (используем сохраненную сетку, если этот кадр пропускаем)
+                # 3. Render output (reuse cached grid on skipped frames)
                 if last_display_grid is not None:
-                    # Исправляем ошибку из логов: используем width='stretch'
+                    # Avoid the logged UI issue by using width='stretch'
                     main_placeholder.image(last_display_grid, channels="BGR", width='stretch')
 
             frame_count += 1
-            # Пауза для стабильности интерфейса
+            # Small pause for UI stability
             time.sleep(0.01)
     finally:
-        # Корректное завершение при снятии галочки
+        # Clean shutdown when the checkbox is turned off
         if not run_watch and 'streams' in st.session_state:
             for s in st.session_state.streams:
                 s.stop()

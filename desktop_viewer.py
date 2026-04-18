@@ -20,14 +20,14 @@ SHM_SHAPE = (200, 640, 640, 3)
 REDIS_BATCH = 64
 WARNINGS_KEY = "proctor_warnings"
 
-# Связи между точками (для линий) — под COCO-подобную разметку (как в post_processor.py)
+# Keypoint links for drawing lines in a COCO-like layout (same as post_processor.py)
 SKELETON_PAIRS = [
-    (5, 6),  # плечи
+    (5, 6),  # shoulders
     (5, 7),
-    (7, 9),  # левая рука
+    (7, 9),  # left arm
     (6, 8),
-    (8, 10),  # правая рука
-    (11, 12),  # бёдра
+    (8, 10),  # right arm
+    (11, 12),  # hips
     (11, 13),
     (13, 15),
     (12, 14),
@@ -46,7 +46,7 @@ def _ensure_size(img: np.ndarray, w: int, h: int) -> np.ndarray:
 def _draw_pose(frame: np.ndarray, kpts: np.ndarray, conf_thr: float = 0.3) -> np.ndarray:
     """
     kpts.shape: (num_people, num_points, 3) -> (x, y, conf)
-    Рисуем точки и линии как в streamlit post_processor.
+    Draw keypoints and skeleton lines, consistent with the Streamlit post-processor.
     """
     if frame is None or kpts is None or kpts.size == 0:
         return frame
@@ -56,14 +56,14 @@ def _draw_pose(frame: np.ndarray, kpts: np.ndarray, conf_thr: float = 0.3) -> np
 
     for p in range(num_people):
         person_kpts = kpts[p]
-        # Точки
+        # Points
         for j in range(num_joints):
             x, y, conf = person_kpts[j]
             if conf < conf_thr:
                 continue
             cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1)
 
-        # Линии
+        # Lines
         for j1, j2 in SKELETON_PAIRS:
             if j1 >= num_joints or j2 >= num_joints:
                 continue
@@ -139,7 +139,7 @@ def _render_warnings_panel(warnings: deque, w: int = 520, h: int = 360) -> np.nd
 
 def _run_cameras_loop(stop_evt: threading.Event):
     r = redis.Redis(host="localhost", port=6379)
-    # Стартуем "с чистого листа", чтобы не показывать старые варнинги/кадры из очереди
+    # Start from a clean state to avoid showing stale warnings/frames from the queue
     try:
         r.delete(QUEUE_NAME)
     except Exception:
@@ -151,10 +151,15 @@ def _run_cameras_loop(stop_evt: threading.Event):
     frames_by_cam = {}
     cam_order = []
 
+    # Active warning map: {cam_id: {track_id: timestamp_when_warned}}
+    # Keep each warning visible for 30 seconds
+    active_warnings = {}  # cam_id -> {track_id: warn_time}
+    WARNING_DISPLAY_TIME = 30.0  # warning display duration in seconds
+
     cv2.namedWindow("Cameras", cv2.WINDOW_NORMAL)
 
-    # Размеры тайла меньше, чем 640, чтобы сетка влезала на экран
-    # Пагинация: 4 камеры на страницу (2x2)
+    # Tile size is smaller than 640 so the grid fits on screen
+    # Pagination: 4 cameras per page (2x2)
     cols = 2
     tile_w, tile_h = 320, 320
     last_render = 0.0
@@ -169,11 +174,11 @@ def _run_cameras_loop(stop_evt: threading.Event):
             return
         if not cam_order:
             return
-        # Если уже в "зуме" — клик возвращает назад
+        # If already zoomed in, click to return to mosaic
         if selected_cam is not None:
             selected_cam = None
             return
-        # Вычисляем индекс плитки по координатам клика
+        # Compute tile index from click coordinates
         c = int(x // tile_w)
         r_ = int(y // tile_h)
         idx = r_ * cols + c
@@ -188,7 +193,7 @@ def _run_cameras_loop(stop_evt: threading.Event):
 
     try:
         while not stop_evt.is_set():
-            # Батч-забор из Redis (меньше накладных расходов, меньше лагов UI)
+            # Batch fetch from Redis (lower overhead, smoother UI)
             pipe = r.pipeline()
             pipe.lrange(QUEUE_NAME, 0, REDIS_BATCH - 1)
             pipe.ltrim(QUEUE_NAME, REDIS_BATCH, -1)
@@ -205,12 +210,14 @@ def _run_cameras_loop(stop_evt: threading.Event):
 
                     idx = int(meta.get("idx", 0))
                     cam_id = str(meta.get("cid", "unknown"))
-                    warn_text = meta.get("warn", "") or ""
-                    pose_score = meta.get("pose_score", None)
+
+                    # warnings is a list; keep only dist_warning entries
+                    warnings_list = meta.get("warnings", []) or []
+                    dist_warnings = [w for w in warnings_list if w.get("type") == "dist_warning"]
 
                     frame = shared_array[idx].copy()
 
-                    # Восстановим keypoints и нарисуем скелет
+                    # Rebuild keypoints tensor and draw skeleton
                     try:
                         kpt_shape = meta.get("kpt_shape", None)
                         kpt_bytes = meta.get("kpt", None)
@@ -220,25 +227,47 @@ def _run_cameras_loop(stop_evt: threading.Event):
                     except Exception:
                         pass
 
-                    # Нарисуем warning на самом тайле, чтобы видно было даже в сетке
-                    if warn_text:
-                        score_str = f"{float(pose_score):.1f}" if pose_score is not None else "?"
-                        cv2.putText(
-                            frame,
-                            f"WARNING: {warn_text} ({score_str})",
-                            (12, 32),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 0, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                    # Store new warnings in active_warnings
+                    now_time = time.time()
+                    if dist_warnings:
+                        if cam_id not in active_warnings:
+                            active_warnings[cam_id] = {}
+                        for warn in dist_warnings:
+                            track_id = warn.get("track_id", "?")
+                            active_warnings[cam_id][track_id] = now_time
+                            print(f"[VIEWER] ⚠️ WARNING: camera {cam_id}, ID {track_id}")
+
+                    # Draw all active warnings for this camera (last 30 seconds)
+                    if cam_id in active_warnings:
+                        y_offset = 32
+                        expired_ids = []
+                        for track_id, warn_time in active_warnings[cam_id].items():
+                            age = now_time - warn_time
+                            if age > WARNING_DISPLAY_TIME:
+                                expired_ids.append(track_id)
+                                continue
+                            # Red warning text with track ID
+                            remaining = int(WARNING_DISPLAY_TIME - age)
+                            cv2.putText(
+                                frame,
+                                f"CHEATING: ID {track_id} ({remaining}s)",
+                                (12, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8,
+                                (0, 0, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+                            y_offset += 30
+                        # Remove expired warning entries
+                        for tid in expired_ids:
+                            del active_warnings[cam_id][tid]
 
                     frames_by_cam[cam_id] = frame
                     if cam_id not in cam_order:
                         cam_order.append(cam_id)
 
-            # Рендерим ~30 FPS (и не зависим от частоты прихода меты)
+            # Render at ~30 FPS independently of metadata arrival rate
             now = time.time()
             if now - last_render >= 1.0 / 30.0:
                 total_pages = max(1, int(np.ceil(len(cam_order) / per_page))) if cam_order else 1
@@ -254,7 +283,7 @@ def _run_cameras_loop(stop_evt: threading.Event):
                 mosaic_rows = int(np.ceil(len(page_cams) / cols)) if page_cams else 1
                 mosaic = _make_mosaic(frames_by_cam, page_cams, cols=cols, tile_w=tile_w, tile_h=tile_h)
 
-                # Подсказка по управлению
+                # Controls hint
                 hint = "Click tile: zoom/back. A/D or Left/Right: pages. Q/Esc: quit."
                 cv2.putText(
                     mosaic,
@@ -280,7 +309,7 @@ def _run_cameras_loop(stop_evt: threading.Event):
                 if selected_cam is None:
                     cv2.imshow("Cameras", mosaic)
                 else:
-                    # Полноэкранный режим выбранной камеры
+                    # Full-screen view for selected camera
                     frame = frames_by_cam.get(selected_cam)
                     frame = _ensure_size(frame, 640, 640)
                     cv2.putText(
@@ -297,7 +326,7 @@ def _run_cameras_loop(stop_evt: threading.Event):
 
                 last_render = now
 
-            # На Windows стрелки/функциональные клавиши корректнее читать через waitKeyEx
+            # On Windows, arrow/function keys are more reliable via waitKeyEx
             key_ex = cv2.waitKeyEx(1)
             key = key_ex & 0xFF
 
@@ -305,15 +334,15 @@ def _run_cameras_loop(stop_evt: threading.Event):
                 break
             if key == ord("b"):
                 selected_cam = None
-            # страницы
+            # Page navigation
             if key in (ord("a"), ord("A"), ord("j"), ord("J")):  # prev
                 if selected_cam is None:
                     page = max(0, page - 1)
             if key in (ord("d"), ord("D"), ord("l"), ord("L")):  # next
                 if selected_cam is None:
                     page = page + 1
-            # Стрелки / PgUp / PgDn (waitKeyEx возвращает platform-specific codes)
-            # Частые коды Windows: Left=2424832, Right=2555904, PgUp=2162688, PgDn=2228224
+            # Arrow keys / PgUp / PgDn (waitKeyEx returns platform-specific codes)
+            # Common Windows codes: Left=2424832, Right=2555904, PgUp=2162688, PgDn=2228224
             if key_ex in (2424832, 81, 65361, 63234):  # left
                 if selected_cam is None:
                     page = max(0, page - 1)
@@ -339,8 +368,8 @@ def _run_cameras_loop(stop_evt: threading.Event):
 
 
 def main():
-    # Главное окно варнингов (скролл/фильтр/Show cheaters) — это Tkinter.
-    # На Windows Tk лучше держать в главном потоке, а OpenCV-картинки крутить в фоне.
+    # The warnings window (scroll/filter/Show cheaters) runs on Tkinter.
+    # On Windows, Tk should stay on the main thread while OpenCV runs in background.
     import tkinter as tk
     from warnings_window import WarningsApp
 
@@ -351,7 +380,7 @@ def main():
     root = tk.Tk()
     app = WarningsApp(root)
 
-    # Перехват закрытия: закрываем и камеры тоже
+    # Intercept close event and stop camera loop as well
     def on_close():
         stop_evt.set()
         try:
@@ -362,7 +391,7 @@ def main():
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
-    # Подождём корректного выхода камеры
+    # Wait for camera loop to shut down gracefully
     stop_evt.set()
     try:
         cam_thread.join(timeout=2.0)

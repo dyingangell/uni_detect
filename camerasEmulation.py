@@ -2,33 +2,33 @@ import subprocess
 import sys
 import time
 
-# Настройки теста
-NUM_CAMERAS = 32  # Попробуй сначала 20, потом увеличивай до 100
-VIDEO_PATH = "video/test7.mp4" # Путь к твоему тестовому файлу
+# Test settings
+NUM_CAMERAS = 32  # Start with 20 and scale up to 100
+VIDEO_PATH = "video/test7.mp4" # Path to your test video file
 PRODUCER_SCRIPT = "producer.py"
 PYTHON_EXE = sys.executable
 processes = []
 
-print(f"Запуск {NUM_CAMERAS} эмуляторов камер...")
+print(f"Starting {NUM_CAMERAS} camera emulators...")
 
 for i in range(1, NUM_CAMERAS + 1):
-    # Запускаем каждый продюсер как отдельный фоновый процесс
-    # Команда: python producer.py [ID] [PATH]
+    # Start each producer as a separate background process
+    # Command: python producer.py [ID] [PATH]
     time.sleep(0.1)
     p = subprocess.Popen([PYTHON_EXE, PRODUCER_SCRIPT, str(i), VIDEO_PATH])
     processes.append(p)
 
 
 
-print(f"\nВсе {NUM_CAMERAS} камер запущены.")
-print("Нажми Ctrl+C, чтобы остановить все тесты.")
+print(f"\nAll {NUM_CAMERAS} cameras are running.")
+print("Press Ctrl+C to stop all tests.")
 
 try:
-    # Держим скрипт активным, пока работают процессы
+    # Keep script alive while child processes are running
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
-    print("\nОстановка всех камер...")
+    print("\nStopping all cameras...")
     for p in processes:
         p.terminate()
-    print("Тест завершен.")
+    print("Test finished.")
