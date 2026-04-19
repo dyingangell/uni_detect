@@ -29,7 +29,7 @@ class WarningEvent:
     video_time: str = ""
     real_time: str = ""
     person_key: str = ""
-    status: str = "pending"  # pending|cheating|not_cheating
+    status: str = "pending"  # pending|cheating|not_cheating    ffff
     decision_ts: float = 0.0
     box: list[int] | None = None
     evidence_path: str = ""
