@@ -55,6 +55,7 @@ def camera_worker(cam_id, video_file):
         time.sleep(0.2)
 
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python multithread.py <folder_num>")

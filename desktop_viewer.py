@@ -20,7 +20,7 @@ SHM_SHAPE = (200, 720, 1280, 3)
 REDIS_BATCH = 64
 WARNINGS_KEY = "proctor_warnings"
 
-# Keypoint links for drawing lines in a COCO-like layout (same as post_processor.py)
+# Keypoint links for drawing lines between joints, consistent with Streamlit post-processor
 SKELETON_PAIRS = [
     (5, 6),  # shoulders
     (5, 7),
