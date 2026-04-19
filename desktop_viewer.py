@@ -27,7 +27,7 @@ SKELETON_PAIRS = [
     (7, 9),  # left arm
     (6, 8),
     (8, 10),  # right arm
-    (11, 12),  # hips
+    (11, 12),  # hips f
     (11, 13),
     (13, 15),
     (12, 14),
