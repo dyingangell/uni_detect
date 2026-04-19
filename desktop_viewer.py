@@ -16,7 +16,7 @@ import msgpack
 
 QUEUE_NAME = "raw_ai_results"
 SHM_NAME = "cv_frame_buffer"
-SHM_SHAPE = (200, 640, 640, 3)
+SHM_SHAPE = (200, 720, 1280, 3)
 REDIS_BATCH = 64
 WARNINGS_KEY = "proctor_warnings"
 

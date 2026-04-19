@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     # Clear only relevant queues/state (safer than FLUSHALL)
     try:
-        r.delete(QUEUE_NAME, "raw_ai_results", "proctor_warnings")
+        r.delete(QUEUE_NAME, "raw_ai_results", "proctor_warnings", "proctor_decisions")
     except Exception:
         pass
     executor = ThreadPoolExecutor(max_workers=8)

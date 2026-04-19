@@ -30,25 +30,57 @@ class ProctoringEngine:
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
         self.shm = shared_memory.SharedMemory(name="cv_frame_buffer")
-        # Create a NumPy view over shared memory
-        self.shared_array = np.ndarray((200, 640, 640, 3), dtype=np.uint8, buffer=self.shm.buf)
+        # Create a NumPy view over shared memory (H, W, C)
+        self.shared_array = np.ndarray((200, 720, 1280, 3), dtype=np.uint8, buffer=self.shm.buf)
         # State containers
         self.r = redis.Redis(host='localhost', port=6379)
         self.last_save = {}
         self.phone_counters = {}
         self.cooldown = 3
-        # Interpret threshold as "seconds of suspicious behavior", not frame count
-        self.threshold = 5.0  # Seconds of suspicious behavior required before raising a warning
+
+        # ---- Pose anti-cheat tuning ("circle" / sensitivity) ----
+        # You can override these without editing code via env vars:
+        #   POSE_BASE_RADIUS, POSE_WARN_THRESHOLD_S, POSE_CALIB_S, POSE_MAX_AWAY_DIST, POSE_WALK_PX
+        # Circle radius in normalized units (nose offset / shoulder width). Bigger => less sensitive.
+        self.pose_base_radius = float(os.getenv("POSE_BASE_RADIUS", "0.35"))
+        # Seconds of suspicious behavior required before raising a warning. Bigger => fewer warnings.
+        self.threshold = float(os.getenv("POSE_WARN_THRESHOLD_S", "8.0"))
+        # Calibration window (seconds) when baseline is learned.
+        self.pose_calib_s = float(os.getenv("POSE_CALIB_S", "10.0"))
+        # If person is *too far* from baseline, treat as "away" and do not warn.
+        self.pose_max_away_dist = float(os.getenv("POSE_MAX_AWAY_DIST", "1.2"))
+        # Walking detection threshold (pixels per frame for bbox center).
+        self.pose_walk_speed_threshold = float(os.getenv("POSE_WALK_PX", "30.0"))
         self.detections = [] # Used for table/UI output
         # Pose-based anti-cheating state (per camera)
         self.pose_state = {}  # cam_id_track_id -> state dict
-        self.warned_persons = set()  # Global set of already-warned identities (cam_id_track_id)
+        # Confirmed cheaters (hard stop for this exact person_key)
+        self.warned_persons = set()  # person_key
+
+        # Confirmation workflow:
+        # - After first warning for a person, they become "pending" until an operator confirms.
+        # - If confirmed cheating -> stop tracking (banned).
+        # - If false positive -> cooldown 2 minutes, then resume tracking and allow a new warning.
+        self.decisions_key = "proctor_decisions"
+        self.confirm_cooldown_s = 120.0
+        self.pending_ttl_s = 60.0 * 60.0  # auto-expire pending if UI never answers
+        # person_key -> {state: pending|cooldown|banned, until: ts, cam_id, track_id}
+        self.person_gate: dict[str, dict] = {}
+
+        # Anti-spam: suppress repeats when ByteTrack re-assigns track_id.
+        # Storage format: cam_id -> list[{'box': (x1,y1,x2,y2), 'cx': float, 'cy': float, 'state': str, 'until': float}]
+        self.warned_boxes_by_cam: dict[str, list[dict]] = {}
+        self.warned_box_ttl_s = 24 * 60 * 60  # keep banned zones for 24 hours (session-level)
+        self.warned_iou_thr = float(os.getenv("POSE_WARN_IOU_THR", "0.25"))  # lower => more dedupe
+        # Pixel distance between bbox centers to treat as the same seated person (more stable than IoU)
+        self.pose_warn_center_px = float(os.getenv("POSE_WARN_CENTER_PX", "140"))
         self.start_time = time.time()  # Engine start time for video timeline calculations
 
         # Clear Redis queues on startup to avoid stale warnings/results
         try:
             self.r.delete("proctor_warnings")
             self.r.delete("raw_ai_results")
+            self.r.delete(self.decisions_key)
             print("[INFO] Redis queues cleared at startup")
         except Exception as e:
             print(f"[WARN] Failed to clear Redis queues: {e}")
@@ -65,7 +97,7 @@ class ProctoringEngine:
         except Exception:
             return default
 
-    def _save_evidence_frame(self, frame: np.ndarray, person_box: np.ndarray,
+    def _save_evidence_frame(self, frame: np.ndarray, person_box,
                              cam_id: str, track_id: int, video_time_str: str,
                              real_time_str: str, now_ts: float):
         """
@@ -76,15 +108,15 @@ class ProctoringEngine:
             # Debug: log frame status
             if frame is None:
                 print(f"[EVIDENCE] WARNING: frame is None")
-                return
+                return None
 
             if not isinstance(frame, np.ndarray):
                 print(f"[EVIDENCE] WARNING: frame is not ndarray, got {type(frame)}")
-                return
+                return None
 
             if frame.size == 0:
                 print(f"[EVIDENCE] WARNING: frame is empty")
-                return
+                return None
 
             print(f"[EVIDENCE] Processing frame: shape={frame.shape}, dtype={frame.dtype}")
 
@@ -125,11 +157,12 @@ class ProctoringEngine:
                 print(f"[EVIDENCE] ✅ Saved: {evidence_path}")
             else:
                 print(f"[EVIDENCE] ❌ Failed to save: {evidence_path}")
-                return
+                return None
 
             # Also save metadata JSON alongside the image
             metadata = {
                 "evidence_file": evidence_filename,
+                "evidence_path": evidence_path,
                 "cam_id": cam_id,
                 "track_id": track_id,
                 "video_time": video_time_str,
@@ -141,10 +174,17 @@ class ProctoringEngine:
                 json.dump(metadata, f, indent=2)
             print(f"[EVIDENCE] ✅ Metadata: {metadata_path}")
 
+            return {
+                "evidence_file": evidence_filename,
+                "evidence_path": evidence_path,
+                "metadata_path": metadata_path,
+            }
+
         except Exception as e:
             print(f"[ERROR] Exception in _save_evidence_frame: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
+            return None
 
     @staticmethod
     def _pose_suspicion_from_kpts(person_kpts: np.ndarray):
@@ -187,17 +227,234 @@ class ProctoringEngine:
 
         return rel_nose_x, rel_nose_y, shoulder_w, True
 
+    @staticmethod
+    def _bbox_iou_xyxy(a_xyxy, b_xyxy) -> float:
+        """IoU for boxes in (x1, y1, x2, y2) format."""
+        try:
+            ax1, ay1, ax2, ay2 = map(float, a_xyxy)
+            bx1, by1, bx2, by2 = map(float, b_xyxy)
+        except Exception:
+            return 0.0
+
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+
+        a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = a_area + b_area - inter
+        if denom <= 0.0:
+            return 0.0
+        return float(inter / denom)
+
+    def _cleanup_warned_boxes(self, cam_id: str, now_ts: float) -> None:
+        cam_id = str(cam_id)
+        lst = self.warned_boxes_by_cam.get(cam_id)
+        if not lst:
+            return
+        alive = [it for it in lst if float(now_ts) <= float(it.get("until", 0.0))]
+        if len(alive) != len(lst):
+            self.warned_boxes_by_cam[cam_id] = alive
+
+    def _match_warned_box(self, cam_id: str, person_box, now_ts: float) -> dict | None:
+        """Return matched warned-box record {state, until, box} or None."""
+        if person_box is None or len(person_box) < 4:
+            return None
+
+        cam_id = str(cam_id)
+        self._cleanup_warned_boxes(cam_id, now_ts)
+        lst = self.warned_boxes_by_cam.get(cam_id, [])
+        if not lst:
+            return None
+
+        x1, y1, x2, y2 = float(person_box[0]), float(person_box[1]), float(person_box[2]), float(person_box[3])
+        cur = (x1, y1, x2, y2)
+        cur_cx = (x1 + x2) / 2.0
+        cur_cy = (y1 + y2) / 2.0
+
+        for it in lst:
+            box = it.get("box")
+            if not box:
+                continue
+            # Match either by IoU OR by stable center distance (handles leaning / bbox resize)
+            iou_ok = self._bbox_iou_xyxy(cur, box) >= float(self.warned_iou_thr)
+            try:
+                it_cx = float(it.get("cx"))
+                it_cy = float(it.get("cy"))
+                d = ((cur_cx - it_cx) ** 2 + (cur_cy - it_cy) ** 2) ** 0.5
+                center_ok = d <= float(self.pose_warn_center_px)
+            except Exception:
+                center_ok = False
+
+            if (iou_ok or center_ok) and float(now_ts) <= float(it.get("until", 0.0)):
+                return it
+        return None
+
+    def _upsert_warned_box(self, cam_id: str, person_box, now_ts: float,
+                           state: str, until: float) -> None:
+        """Insert or update warned-box record for this camera by IoU match."""
+        if person_box is None or len(person_box) < 4:
+            return
+        cam_id = str(cam_id)
+        self._cleanup_warned_boxes(cam_id, now_ts)
+
+        x1, y1, x2, y2 = float(person_box[0]), float(person_box[1]), float(person_box[2]), float(person_box[3])
+        cur = (x1, y1, x2, y2)
+        cur_cx = (x1 + x2) / 2.0
+        cur_cy = (y1 + y2) / 2.0
+        lst = self.warned_boxes_by_cam.setdefault(cam_id, [])
+
+        for it in lst:
+            box = it.get("box")
+            if not box:
+                continue
+            # Update if same by IoU OR by center distance
+            iou_ok = self._bbox_iou_xyxy(cur, box) >= float(self.warned_iou_thr)
+            try:
+                it_cx = float(it.get("cx"))
+                it_cy = float(it.get("cy"))
+                d = ((cur_cx - it_cx) ** 2 + (cur_cy - it_cy) ** 2) ** 0.5
+                center_ok = d <= float(self.pose_warn_center_px)
+            except Exception:
+                center_ok = False
+
+            if iou_ok or center_ok:
+                it["state"] = str(state)
+                it["until"] = float(until)
+                it["box"] = cur
+                it["cx"] = float(cur_cx)
+                it["cy"] = float(cur_cy)
+                return
+
+        lst.append({
+            "box": cur,
+            "cx": float(cur_cx),
+            "cy": float(cur_cy),
+            "state": str(state),
+            "until": float(until),
+        })
+
+    def _drain_decisions(self, now_ts: float, max_items: int = 50) -> None:
+        """Apply operator decisions coming from the warnings UI."""
+        for _ in range(int(max_items)):
+            try:
+                payload = self.r.lpop(self.decisions_key)
+            except Exception:
+                payload = None
+
+            if not payload:
+                break
+
+            try:
+                if isinstance(payload, bytes):
+                    payload = payload.decode("utf-8", errors="replace")
+                obj = json.loads(payload)
+            except Exception:
+                continue
+
+            cam_id = str(obj.get("cam_id", "unknown"))
+            track_id = int(obj.get("track_id", 0) or 0)
+            person_key = str(obj.get("person_key") or f"{cam_id}_{track_id}")
+            decision = str(obj.get("decision", "")).strip().lower()
+
+            prev_gate = self.person_gate.get(person_key) or {}
+            prev_box = prev_gate.get("box")
+            if prev_box is None:
+                st_prev = self.pose_state.get(person_key)
+                if st_prev is not None:
+                    prev_box = st_prev.get("_last_person_box")
+
+            # If UI sends decision for an unknown person, we still store a gate to suppress spam.
+            if decision in ("cheating", "yes", "true", "1"):
+                # Hard stop
+                self.warned_persons.add(person_key)
+                self.person_gate[person_key] = {
+                    "state": "banned",
+                    "until": float(now_ts) + float(self.warned_box_ttl_s),
+                    "cam_id": cam_id,
+                    "track_id": track_id,
+                    "box": prev_box,
+                }
+                if prev_box is not None:
+                    self._upsert_warned_box(cam_id, prev_box, now_ts, state="banned", until=float(now_ts) + float(self.warned_box_ttl_s))
+
+            elif decision in ("not_cheating", "false", "no", "0"):
+                # Cooldown then resume tracking
+                until = float(now_ts) + float(self.confirm_cooldown_s)
+                self.person_gate[person_key] = {
+                    "state": "cooldown",
+                    "until": until,
+                    "cam_id": cam_id,
+                    "track_id": track_id,
+                    "box": prev_box,
+                }
+                # Reset pose state so we don't instantly re-trigger after cooldown
+                try:
+                    self.pose_state.pop(person_key, None)
+                except Exception:
+                    pass
+                if prev_box is not None:
+                    self._upsert_warned_box(cam_id, prev_box, now_ts, state="cooldown", until=until)
+
+            # else: unknown decision -> ignore
+
     def _update_pose_warning_for_person(self, person_key: str, cam_id: str, track_id: int,
-                                          person_kpts: np.ndarray, person_box: np.ndarray, now_ts: float,
+                                          person_kpts: np.ndarray, person_box, now_ts: float,
                                           current_frame: np.ndarray = None):
         """
         Process one tracked person by track_id.
         person_key: unique key in format "cam_id_track_id"
         person_box: [x1, y1, x2, y2, conf, cls]
         """
-        # Fast path: this identity has already been warned, so skip further checks
+        # Hard stop: confirmed cheater
         if person_key in self.warned_persons:
             return ""
+
+        # Gate by confirmation workflow state (pending/cooldown/banned)
+        gate = self.person_gate.get(person_key)
+        if gate is not None:
+            state = str(gate.get("state", ""))
+            until = float(gate.get("until", 0.0) or 0.0)
+            if state == "pending":
+                # Wait for operator, but auto-release if UI never answers
+                if float(now_ts) < until:
+                    return ""
+                try:
+                    del self.person_gate[person_key]
+                except Exception:
+                    pass
+            if state == "banned":
+                return ""
+            if state == "cooldown":
+                if float(now_ts) < until:
+                    return ""
+                # Cooldown is over -> resume
+                try:
+                    del self.person_gate[person_key]
+                except Exception:
+                    pass
+
+        # If tracker reassigned track_id, suppress by bbox match as well
+        match = self._match_warned_box(cam_id, person_box, now_ts)
+        if match is not None:
+            m_state = str(match.get("state", ""))
+            m_until = float(match.get("until", 0.0) or 0.0)
+            if float(now_ts) <= m_until and m_state in ("pending", "cooldown", "banned"):
+                self.person_gate[person_key] = {
+                    "state": m_state,
+                    "until": m_until,
+                    "cam_id": str(cam_id),
+                    "track_id": int(track_id),
+                    "box": match.get("box"),
+                }
+                return ""
 
         st = self.pose_state.get(person_key)
         if st is None:
@@ -205,18 +462,21 @@ class ProctoringEngine:
                 "score_s": 0.0,           # Accumulated "suspicion seconds"
                 "last_warn_ts": 0.0,
                 "last_ts": now_ts,
-                "calib_end_ts": now_ts + 10.0,  # Auto-calibration window (10 seconds)
+                "calib_end_ts": now_ts + float(self.pose_calib_s),  # Auto-calibration window
                 "base_nose_x": None,      # Baseline nose X position (circle center)
                 "base_nose_y": None,      # Baseline nose Y position (circle center)
-                "base_radius": 0.35,      # Radius of the "normal zone" (smaller = more sensitive)
-                "max_away_dist": 1.2,     # Threshold for "person moved far away" (do not warn)
+                "base_radius": float(self.pose_base_radius),      # Radius of the "normal zone" (smaller = more sensitive)
+                "max_away_dist": float(self.pose_max_away_dist),  # Threshold for "person moved far away" (do not warn)
                 "is_away": False,         # Flag indicating the person is far away
                 "track_id": track_id,
                 # Walking detection fields
                 "last_box_cx": None,      # Previous bbox center X
                 "last_box_cy": None,      # Previous bbox center Y
-                "walk_speed_threshold": 30.0,  # Pixels per frame threshold for walking
+                "walk_speed_threshold": float(self.pose_walk_speed_threshold),  # Pixels per frame threshold for walking
             }
+
+        # Remember last bbox for confirmation decisions
+        st["_last_person_box"] = person_box
 
         # Clamp dt to protect against timestamp jumps and long pauses
         dt = max(0.0, min(0.25, float(now_ts - st.get("last_ts", now_ts))))
@@ -311,10 +571,36 @@ class ProctoringEngine:
             st["_last_print_score"] = int(st["score_s"])
             print(f"[DEBUG] {person_key}: score={st['score_s']:.1f}/{self.threshold} (suspicious={suspicious})")
 
-        # Emit warning only once per identity (guard already checked at function entry)
+        # Emit warning once per person until operator confirms
         if float(st["score_s"]) >= float(self.threshold):
+            # If this physical person is already pending/banned/cooldown by bbox, do nothing
+            match2 = self._match_warned_box(cam_id, person_box, now_ts)
+            if match2 is not None:
+                m_state = str(match2.get("state", ""))
+                m_until = float(match2.get("until", 0.0) or 0.0)
+                if float(now_ts) <= m_until and m_state in ("pending", "cooldown", "banned"):
+                    self.person_gate[person_key] = {
+                        "state": m_state,
+                        "until": m_until,
+                        "cam_id": str(cam_id),
+                        "track_id": int(track_id),
+                        "box": match2.get("box"),
+                    }
+                    self.pose_state[person_key] = st
+                    return ""
+
             warn_text = "dist_warning"
-            self.warned_persons.add(person_key)  # Add to global set to prevent repeat warnings
+
+            # Put this person into PENDING state immediately to stop spam
+            pending_until = float(now_ts) + float(self.pending_ttl_s)
+            self.person_gate[person_key] = {
+                "state": "pending",
+                "until": pending_until,
+                "cam_id": str(cam_id),
+                "track_id": int(track_id),
+                "box": person_box,
+            }
+            self._upsert_warned_box(cam_id, person_box, now_ts, state="pending", until=pending_until)
 
             # Compute video-relative and wall-clock timestamps
             video_time_sec = now_ts - self.start_time
@@ -332,22 +618,28 @@ class ProctoringEngine:
             print(f"📊 Type:        dist_warning")
             print(f"{'='*60}\n")
 
-            warning_data = {
+            warning_data: dict[str, object] = {
                 "ts": now_ts,
                 "cam_id": cam_id,
                 "track_id": track_id,
+                "person_key": person_key,
                 "type": "dist_warning",
                 "video_time": video_time_str,
                 "real_time": current_time_str
             }
-            print(f"[DEBUG] Sending to Redis: {warning_data}")
+            # Include bbox for easier debugging and possible future UI highlight
             try:
-                self.r.rpush("proctor_warnings", json.dumps(warning_data))
-            except Exception as e:
-                print(f"[ERROR] Redis error: {e}")
-
+                if person_box is not None and len(person_box) >= 4:
+                    warning_data["box"] = [
+                        int(float(person_box[0])),
+                        int(float(person_box[1])),
+                        int(float(person_box[2])),
+                        int(float(person_box[3])),
+                    ]
+            except Exception:
+                pass
             # Save evidence frame with bounding box and metadata
-            self._save_evidence_frame(
+            evidence = self._save_evidence_frame(
                 frame=current_frame,
                 person_box=person_box,
                 cam_id=cam_id,
@@ -356,6 +648,18 @@ class ProctoringEngine:
                 real_time_str=current_time_str,
                 now_ts=now_ts
             )
+
+            if isinstance(evidence, dict):
+                warning_data.update({
+                    "evidence_file": evidence.get("evidence_file"),
+                    "evidence_path": evidence.get("evidence_path"),
+                })
+
+            print(f"[DEBUG] Sending to Redis: {warning_data}")
+            try:
+                self.r.rpush("proctor_warnings", json.dumps(warning_data))
+            except Exception as e:
+                print(f"[ERROR] Redis error: {e}")
 
         self.pose_state[person_key] = st
         return warn_text
@@ -377,7 +681,14 @@ class ProctoringEngine:
             track_id = int(track_ids[idx])
             person_key = f"{cam_id}_{track_id}"
             person_kpts = kpts[idx]
-            person_box = boxes[idx] if boxes is not None and idx < len(boxes) else None
+            person_box = None
+            if boxes is not None and idx < len(boxes):
+                try:
+                    b = boxes[idx]
+                    # Keep only xyxy in a simple tuple so it survives across frames/decisions
+                    person_box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                except Exception:
+                    person_box = None
 
             warn_text = self._update_pose_warning_for_person(
                 person_key, cam_id, track_id, person_kpts, person_box, now_ts, current_frame
@@ -395,6 +706,11 @@ class ProctoringEngine:
             return frames, self.detections
 
         current_time = time.time()
+        # Apply operator confirmations ASAP (cheap non-blocking lpop loop)
+        try:
+            self._drain_decisions(current_time)
+        except Exception:
+            pass
         all_results = []
         all_pose_results = []
         display_time = time.strftime("%H:%M:%S")
@@ -419,7 +735,7 @@ class ProctoringEngine:
                 persist=True,
                 conf=0.05,      # Keep low-confidence skeletons for tracker stability
                 iou=0.5,       # Helps avoid merging nearby seated students
-                imgsz=640,
+                imgsz=1280,
                 half=True,
                 tracker="bytetrack.yaml",
                 verbose=False,

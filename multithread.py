@@ -39,7 +39,7 @@ def camera_worker(cam_id, video_file):
             continue
 
         # Resize to 640x640 (since GStreamer videoscale is not used)
-        frame_resized = cv2.resize(frame, (640, 640))
+        frame_resized = cv2.resize(frame, (1280 ,720))
 
         # Encode as JPEG
         _, img_encoded = cv2.imencode('.jpg', frame_resized)

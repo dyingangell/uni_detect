@@ -2,7 +2,7 @@ from multiprocessing import shared_memory
 import time
 
 SHM_NAME = "cv_frame_buffer"
-SIZE = int(200 * 640 * 640 * 3)
+SIZE = int(200 * 1280 * 720 * 3)
 
 def start_master():
     try:

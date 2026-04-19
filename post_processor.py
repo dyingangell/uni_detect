@@ -14,7 +14,7 @@ import streamlit as st
 
 # Attach to the same shared memory buffer
 shm = shared_memory.SharedMemory(name="cv_frame_buffer")
-shared_array = np.ndarray((200, 640, 640, 3), dtype=np.uint8, buffer=shm.buf)
+shared_array = np.ndarray((200, 720, 1280, 3), dtype=np.uint8, buffer=shm.buf)
 r = redis.Redis(host='localhost', port=6379)
 r.delete("raw_ai_results")
 
@@ -28,7 +28,7 @@ for cam_id in range(1, num_cams + 1):
     with col:
         st.markdown(f"**Cam {cam_id}**")
         cam_placeholders[str(cam_id)] = st.image(
-            np.zeros((640, 640, 3), dtype=np.uint8), channels="BGR", width=320
+            np.zeros((720, 1280, 3), dtype=np.uint8), channels="BGR", width=320
         )
 
 while True:
