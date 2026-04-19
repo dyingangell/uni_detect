@@ -19,6 +19,9 @@ class WarningEvent:
     ts: float
     cam_id: str
     type: str
+    track_id: int = 0
+    video_time: str = ""
+    real_time: str = ""
 
     @staticmethod
     def from_payload(payload: str) -> "WarningEvent | None":
@@ -32,15 +35,18 @@ class WarningEvent:
                 return None
             ts = float(obj.get("ts", time.time()))
             cam_id = str(obj.get("cam_id", "unknown"))
-            print(f"[WARN_WINDOW] ✅ Accepted dist_warning for camera {cam_id}")
-            return WarningEvent(ts=ts, cam_id=cam_id, type=wtype)
+            track_id = int(obj.get("track_id", 0))
+            video_time = str(obj.get("video_time", ""))
+            real_time = str(obj.get("real_time", ""))
+            print(f"[WARN_WINDOW] ✅ Accepted dist_warning for camera {cam_id}, track_id={track_id}, video_time={video_time}")
+            return WarningEvent(ts=ts, cam_id=cam_id, type=wtype, track_id=track_id, video_time=video_time, real_time=real_time)
         except Exception as e:
             print(f"[WARN_WINDOW] Parsing error: {e}")
             return None
 
     def pretty(self) -> str:
         tstr = time.strftime("%H:%M:%S", time.localtime(self.ts))
-        return f"[{tstr}] cam={self.cam_id} {self.type}"
+        return f"[{tstr}] cam={self.cam_id} id={self.track_id} {self.type}"
 
 
 class WarningsApp:
@@ -158,7 +164,14 @@ class WarningsApp:
         ev = self.events[real_indices[visible_idx]]
         self.details.configure(state="normal")
         self.details.delete("1.0", tk.END)
-        self.details.insert("1.0", json.dumps({"ts": ev.ts, "cam_id": ev.cam_id, "type": ev.type}, ensure_ascii=False, indent=2))
+        self.details.insert("1.0", json.dumps({
+            "ts": ev.ts,
+            "cam_id": ev.cam_id,
+            "track_id": ev.track_id,
+            "type": ev.type,
+            "video_time": ev.video_time,
+            "real_time": ev.real_time
+        }, ensure_ascii=False, indent=2))
         self.details.configure(state="disabled")
 
     def _clear(self):
@@ -181,7 +194,15 @@ class WarningsApp:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 for ev in self.events:
-                    f.write(json.dumps({"ts": ev.ts, "cam_id": ev.cam_id, "type": ev.type}, ensure_ascii=False) + "\n")
+                    warning_data = {
+                        "ts": ev.ts,
+                        "cam_id": ev.cam_id,
+                        "track_id": ev.track_id,
+                        "type": ev.type,
+                        "video_time": ev.video_time,
+                        "real_time": ev.real_time
+                    }
+                    f.write(json.dumps(warning_data, ensure_ascii=False) + "\n")
             messagebox.showinfo("Export", f"Saved {len(self.events)} events to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e))
