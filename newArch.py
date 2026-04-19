@@ -65,6 +65,87 @@ class ProctoringEngine:
         except Exception:
             return default
 
+    def _save_evidence_frame(self, frame: np.ndarray, person_box: np.ndarray,
+                             cam_id: str, track_id: int, video_time_str: str,
+                             real_time_str: str, now_ts: float):
+        """
+        Save evidence frame with cheater's bounding box highlighted.
+        Used to visually identify who the cheating person is.
+        """
+        try:
+            # Debug: log frame status
+            if frame is None:
+                print(f"[EVIDENCE] WARNING: frame is None")
+                return
+
+            if not isinstance(frame, np.ndarray):
+                print(f"[EVIDENCE] WARNING: frame is not ndarray, got {type(frame)}")
+                return
+
+            if frame.size == 0:
+                print(f"[EVIDENCE] WARNING: frame is empty")
+                return
+
+            print(f"[EVIDENCE] Processing frame: shape={frame.shape}, dtype={frame.dtype}")
+
+            frame_copy = frame.copy()
+
+            # Draw bounding box around the cheating person
+            if person_box is not None and len(person_box) >= 4:
+                x1, y1, x2, y2 = int(person_box[0]), int(person_box[1]), int(person_box[2]), int(person_box[3])
+                # Bright red for the cheater
+                cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                # Write track_id above the box
+                cv2.putText(frame_copy, f"ID:{track_id}", (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+
+            # Add metadata overlay
+            cv2.putText(frame_copy, f"Camera: {cam_id}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame_copy, f"Video time: {video_time_str}", (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame_copy, f"Real time: {real_time_str}", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame_copy, "CHEATING DETECTED!", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+            # Ensure save directory exists
+            if not os.path.exists(self.save_dir):
+                os.makedirs(self.save_dir)
+                print(f"[EVIDENCE] Created directory: {self.save_dir}")
+
+            # Create evidence filename: cam_id_track_id_timestamp.jpg
+            timestamp_ms = int(now_ts * 1000) % 1000000
+            evidence_filename = f"cheater_cam{cam_id}_id{track_id}_{timestamp_ms}.jpg"
+            evidence_path = os.path.join(self.save_dir, evidence_filename)
+
+            # Try to write file
+            success = cv2.imwrite(evidence_path, frame_copy)
+            if success:
+                print(f"[EVIDENCE] ✅ Saved: {evidence_path}")
+            else:
+                print(f"[EVIDENCE] ❌ Failed to save: {evidence_path}")
+                return
+
+            # Also save metadata JSON alongside the image
+            metadata = {
+                "evidence_file": evidence_filename,
+                "cam_id": cam_id,
+                "track_id": track_id,
+                "video_time": video_time_str,
+                "real_time": real_time_str,
+                "timestamp": now_ts
+            }
+            metadata_path = evidence_path.replace(".jpg", ".json")
+            with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+            print(f"[EVIDENCE] ✅ Metadata: {metadata_path}")
+
+        except Exception as e:
+            print(f"[ERROR] Exception in _save_evidence_frame: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+
     @staticmethod
     def _pose_suspicion_from_kpts(person_kpts: np.ndarray):
         """
@@ -107,7 +188,8 @@ class ProctoringEngine:
         return rel_nose_x, rel_nose_y, shoulder_w, True
 
     def _update_pose_warning_for_person(self, person_key: str, cam_id: str, track_id: int,
-                                          person_kpts: np.ndarray, person_box: np.ndarray, now_ts: float):
+                                          person_kpts: np.ndarray, person_box: np.ndarray, now_ts: float,
+                                          current_frame: np.ndarray = None):
         """
         Process one tracked person by track_id.
         person_key: unique key in format "cam_id_track_id"
@@ -264,11 +346,22 @@ class ProctoringEngine:
             except Exception as e:
                 print(f"[ERROR] Redis error: {e}")
 
+            # Save evidence frame with bounding box and metadata
+            self._save_evidence_frame(
+                frame=current_frame,
+                person_box=person_box,
+                cam_id=cam_id,
+                track_id=track_id,
+                video_time_str=video_time_str,
+                real_time_str=current_time_str,
+                now_ts=now_ts
+            )
+
         self.pose_state[person_key] = st
         return warn_text
 
     def _update_pose_warning(self, cam_id: str, boxes: np.ndarray, kpts: np.ndarray,
-                              track_ids: np.ndarray, now_ts: float):
+                              track_ids: np.ndarray, now_ts: float, current_frame: np.ndarray = None):
         """
         Process all tracked people in a frame, each with an independent baseline circle.
         Returns: warnings_list (dist_warning only)
@@ -287,7 +380,7 @@ class ProctoringEngine:
             person_box = boxes[idx] if boxes is not None and idx < len(boxes) else None
 
             warn_text = self._update_pose_warning_for_person(
-                person_key, cam_id, track_id, person_kpts, person_box, now_ts
+                person_key, cam_id, track_id, person_kpts, person_box, now_ts, current_frame
             )
 
             # Only append dist_warning events
@@ -366,7 +459,7 @@ class ProctoringEngine:
             )
 
             cam_id = cam_ids[i] if i < len(cam_ids) else "unknown"
-            warnings = self._update_pose_warning(str(cam_id), boxes, kpts, track_ids, current_time)
+            warnings = self._update_pose_warning(str(cam_id), boxes, kpts, track_ids, current_time, frames[i])
 
             meta = {
                 "idx": shm_idx,
