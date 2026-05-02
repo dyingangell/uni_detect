@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import msgpack
+import csv
 
 gst_bin_path = r'D:\program\msvc_x86_64\bin'
 import redis
@@ -10,6 +11,7 @@ import redis
 #     os.add_dll_directory(gst_bin_path)
 import cv2
 import time
+import math
 from ultralytics import YOLO
 from multiprocessing import shared_memory
 # model_det = YOLO('yolo11m.pt') # or your custom .pt path
@@ -42,15 +44,43 @@ class ProctoringEngine:
         # You can override these without editing code via env vars:
         #   POSE_BASE_RADIUS, POSE_WARN_THRESHOLD_S, POSE_CALIB_S, POSE_MAX_AWAY_DIST, POSE_WALK_PX
         # Circle radius in normalized units (nose offset / shoulder width). Bigger => less sensitive.
-        self.pose_base_radius = float(os.getenv("POSE_BASE_RADIUS", "0.35"))
+        # tuned default: slightly larger radius to reduce small-tilt false positives
+        self.pose_base_radius = float(os.getenv("POSE_BASE_RADIUS", "0.38"))
         # Seconds of suspicious behavior required before raising a warning. Bigger => fewer warnings.
-        self.threshold = float(os.getenv("POSE_WARN_THRESHOLD_S", "8.0"))
+        # tuned default: require longer sustained deviation before warning
+        self.threshold = float(os.getenv("POSE_WARN_THRESHOLD_S", "10.0"))
         # Calibration window (seconds) when baseline is learned.
         self.pose_calib_s = float(os.getenv("POSE_CALIB_S", "10.0"))
         # If person is *too far* from baseline, treat as "away" and do not warn.
         self.pose_max_away_dist = float(os.getenv("POSE_MAX_AWAY_DIST", "1.2"))
         # Walking detection threshold (pixels per frame for bbox center).
         self.pose_walk_speed_threshold = float(os.getenv("POSE_WALK_PX", "30.0"))
+        # Multiplier to scale combined excess into score accumulation (bigger => faster alerts)
+        # tuned default: moderate accumulation speed
+        self.pose_score_k = float(os.getenv("POSE_SCORE_K", "1.0"))
+        # Angle-based check: base angle (radians) inside which rotation is considered normal
+        # tuned default: larger angular tolerance (~25 degrees)
+        self.pose_angle_base = float(os.getenv("POSE_ANGLE_BASE_RAD", "0.45"))
+        # Weight of angular excess when combining with distance excess
+        self.pose_angle_weight = float(os.getenv("POSE_ANGLE_WEIGHT", "1.0"))
+        # How to combine distance and angle: 'sum' or 'max'
+        # tuned default: use 'max' to avoid summing small deviations into false positives
+        self.pose_combine_mode = str(os.getenv("POSE_COMBINE_MODE", "max")).lower()
+        # Debugging: write per-frame pose values to CSV for tuning (set POSE_DEBUG=1)
+        self.pose_debug = str(os.getenv("POSE_DEBUG", "0")) == "1"
+        if self.pose_debug:
+            self._pose_debug_csv = os.path.join(self.save_dir, "pose_debug.csv")
+            if not os.path.exists(self._pose_debug_csv):
+                try:
+                    with open(self._pose_debug_csv, "w") as fh:
+                        fh.write("ts,cid,person_key,dist,dist_excess,abs_angle,angle_excess_norm,combined_excess,score_s\n")
+                except Exception:
+                    pass
+        # Optionally save candidate frames/clips for offline labelling (set POSE_SAVE_CLIPS=1)
+        self.pose_save_clips = str(os.getenv("POSE_SAVE_CLIPS", "0")) == "1"
+        if self.pose_save_clips:
+            self._clip_debug_dir = os.path.join(self.save_dir, "clip_debug")
+            os.makedirs(self._clip_debug_dir, exist_ok=True)
         self.detections = [] # Used for table/UI output
         # Pose-based anti-cheating state (per camera)
         self.pose_state = {}  # cam_id_track_id -> state dict
@@ -84,6 +114,14 @@ class ProctoringEngine:
             print("[INFO] Redis queues cleared at startup")
         except Exception as e:
             print(f"[WARN] Failed to clear Redis queues: {e}")
+
+        # Auto-tune parameters from debug CSV if requested (no manual labelling needed)
+        if str(os.getenv("POSE_AUTO_TUNE", "0")) == "1":
+            try:
+                res = self.auto_tune_from_debug_csv()
+                print(f"[AUTO_TUNE] Completed: {res}")
+            except Exception as e:
+                print(f"[AUTO_TUNE] Failed: {e}")
 
         #stats
         self.frameCount = 0
@@ -226,6 +264,55 @@ class ProctoringEngine:
         rel_nose_y = (ny - mid_y) / shoulder_w
 
         return rel_nose_x, rel_nose_y, shoulder_w, True
+
+    @staticmethod
+    def _pose_suspicion_with_angle(person_kpts: np.ndarray):
+        """
+        Extended pose suspicion: also compute nose-vs-torso signed angle (radians).
+        Returns: rel_nose_x, rel_nose_y, shoulder_w, angle_diff, confidence_ok
+        angle_diff is in (-pi, pi]
+        """
+        if person_kpts is None or person_kpts.size == 0:
+            return None, None, None, None, False
+
+        def kp(i):
+            x, y, c = person_kpts[i]
+            return float(x), float(y), float(c)
+
+        nx, ny, nc = kp(0)  # nose
+        lsx, lsy, lsc = kp(5)  # left shoulder
+        rsx, rsy, rsc = kp(6)  # right shoulder
+
+        # If core keypoints are missing, we cannot compute a reliable position
+        if nc < 0.3 or lsc < 0.3 or rsc < 0.3:
+            return None, None, None, None, False
+
+        shoulder_w = abs(rsx - lsx)
+        if shoulder_w < 1.0:
+            return None, None, None, None, False
+
+        mid_x = (lsx + rsx) / 2.0
+        mid_y = (lsy + rsy) / 2.0
+
+        rel_nose_x = (nx - mid_x) / shoulder_w
+        rel_nose_y = (ny - mid_y) / shoulder_w
+
+        # Torso vector (right - left)
+        tx = rsx - lsx
+        ty = rsy - lsy
+        # Approximate forward vector by rotating torso vector by +90 degrees
+        fx = -ty
+        fy = tx
+
+        # Compute angles
+        try:
+            angle_nose = math.atan2(ny - mid_y, nx - mid_x)
+            angle_torso = math.atan2(fy, fx)
+            angle_diff = (angle_nose - angle_torso + math.pi) % (2 * math.pi) - math.pi
+        except Exception:
+            angle_diff = 0.0
+
+        return rel_nose_x, rel_nose_y, shoulder_w, float(angle_diff), True
 
     @staticmethod
     def _bbox_iou_xyxy(a_xyxy, b_xyxy) -> float:
@@ -504,16 +591,16 @@ class ProctoringEngine:
             st["last_box_cx"] = box_cx
             st["last_box_cy"] = box_cy
 
-        # Compute nose position for this person
-        rel_nose_x, rel_nose_y = None, None
+        # Compute nose position and relative angle for this person
+        rel_nose_x, rel_nose_y, shoulder_w, angle_diff = None, None, None, None
         try:
-            rel_nose_x, rel_nose_y, shoulder_w, conf_ok = self._pose_suspicion_from_kpts(person_kpts)
+            rel_nose_x, rel_nose_y, shoulder_w, angle_diff, conf_ok = self._pose_suspicion_with_angle(person_kpts)
             if not conf_ok:
                 # Not suspicious: skip this frame when keypoint confidence is insufficient
-                rel_nose_x, rel_nose_y = None, None
+                rel_nose_x, rel_nose_y, angle_diff = None, None, None
         except Exception:
             # Not suspicious: skip this frame on pose parsing errors
-            pass
+            rel_nose_x, rel_nose_y, angle_diff = None, None, None
 
         # Auto-calibrate baseline: collect EMA of nose center during first 10 seconds
         if rel_nose_x is not None and rel_nose_y is not None and now_ts <= float(st["calib_end_ts"]):
@@ -528,10 +615,42 @@ class ProctoringEngine:
         # Check whether nose position exits the baseline circle (only after calibration)
         in_calibration = now_ts <= float(st["calib_end_ts"])
 
+        # combined_excess aggregates distance and angular deviations (initialized to zero)
+        combined_excess = 0.0
+
         if rel_nose_x is not None and rel_nose_y is not None:
             if st["base_nose_x"] is not None and st["base_nose_y"] is not None:
-                # Distance from baseline center to current nose position
+                # Distance from baseline center to current nose position (normalized units)
                 dist = ((rel_nose_x - st["base_nose_x"])**2 + (rel_nose_y - st["base_nose_y"])**2) ** 0.5
+
+                # Compute angular excess (normalized by angle base)
+                angle_excess_norm = 0.0
+                if angle_diff is not None:
+                    abs_angle = abs(float(angle_diff))
+                    angle_excess = max(0.0, abs_angle - float(self.pose_angle_base))
+                    angle_excess_norm = angle_excess / (float(self.pose_angle_base) + 1e-6)
+
+                # Combine distance excess and angular excess
+                dist_excess = max(0.0, dist - st["base_radius"]) if dist is not None else 0.0
+                # two modes: sum (sensitive) or max (stricter)
+                if self.pose_combine_mode == "max":
+                    combined_excess = max(float(dist_excess), float(self.pose_angle_weight) * float(angle_excess_norm))
+                else:
+                    combined_excess = float(dist_excess) + float(self.pose_angle_weight) * float(angle_excess_norm)
+
+                # Debug: optionally log per-frame pose features to CSV for offline tuning
+                if getattr(self, "pose_debug", False):
+                    try:
+                        ts = now_ts
+                        cid = cam_id
+                        pk = person_key
+                        abs_angle = abs(float(angle_diff)) if angle_diff is not None else 0.0
+                        score_now = float(st.get("score_s", 0.0) or 0.0)
+                        line = f"{ts},{cid},{pk},{dist:.4f},{dist_excess:.4f},{abs_angle:.4f},{angle_excess_norm:.4f},{combined_excess:.4f},{score_now:.4f}\n"
+                        with open(getattr(self, "_pose_debug_csv", os.path.join(self.save_dir, "pose_debug.csv")), "a") as fh:
+                            fh.write(line)
+                    except Exception:
+                        pass
 
                 # If person moved very far away, suppress warnings and wait
                 if dist > st["max_away_dist"]:
@@ -545,10 +664,23 @@ class ProctoringEngine:
                     st["is_away"] = False
                     st["score_s"] = 0.0
                     suspicious = False
-                # Regular out-of-circle behavior triggers the only warning type (dist_warning)
+                # Regular out-of-circle or angular behavior triggers warning accumulation
                 # Calibration must be completed first
-                elif dist > st["base_radius"] and not st["is_away"] and not in_calibration:
+                elif combined_excess > 0.0 and not st["is_away"] and not in_calibration:
                     suspicious = True
+
+                # Optionally save candidate frame for offline labelling (throttle per person)
+                if suspicious and getattr(self, "pose_save_clips", False) and current_frame is not None:
+                    last_ts = float(st.get("_last_saved_clip_ts", 0.0) or 0.0)
+                    # throttle saving: at most one per 5 seconds per person
+                    if float(now_ts) - last_ts > 5.0:
+                        try:
+                            fname = f"candidate_cam{cam_id}_id{track_id}_{int(now_ts)}.jpg"
+                            fpath = os.path.join(self._clip_debug_dir, fname)
+                            cv2.imwrite(fpath, current_frame)
+                            st["_last_saved_clip_ts"] = float(now_ts)
+                        except Exception:
+                            pass
 
                 # DEBUG: print state every 30 frames
                 if self.frameCount % 30 == 0:
@@ -560,8 +692,12 @@ class ProctoringEngine:
             # Person is walking: decay score faster
             st["score_s"] = max(0.0, float(st["score_s"]) - dt * 2.0)
         elif suspicious:
-            # 1:1 accumulation (dt seconds -> dt score)
-            st["score_s"] = min(15.0, float(st["score_s"]) + dt * 1.0)  # st["score_s"] = min(10.0, float(st["score_s"]) + dt * 2.0)
+            # Accumulate score proportional to combined_excess (stronger deviations -> faster accumulation)
+            try:
+                add = float(self.pose_score_k) * float(combined_excess) * dt
+            except Exception:
+                add = dt * 1.0
+            st["score_s"] = min(15.0, float(st["score_s"]) + add)
         else:
             # Decay score when behavior returns to normal
             st["score_s"] = max(0.0, float(st["score_s"]) - dt * 1.0)
@@ -653,6 +789,7 @@ class ProctoringEngine:
                 warning_data.update({
                     "evidence_file": evidence.get("evidence_file"),
                     "evidence_path": evidence.get("evidence_path"),
+                    "metadata_path": evidence.get("metadata_path"),
                 })
 
             print(f"[DEBUG] Sending to Redis: {warning_data}")
@@ -700,6 +837,141 @@ class ProctoringEngine:
                 print(f"[ENGINE] ✅ Warning added to list: track_id={track_id}")
 
         return warnings
+
+    def auto_tune_from_debug_csv(self, csv_path: str = None, target_fah: float = 0.5,
+                                 decay: float = 1.0, cooldown_s: float = 60.0,
+                                 k_grid: list | None = None, percentile: float = 95.0):
+        """
+        Auto-tune base_radius, angle_base and pose_score_k from a previously collected
+        debug CSV (written when POSE_DEBUG=1). This is unsupervised: it assumes the
+        CSV mostly contains 'normal' behavior and chooses parameters so that the
+        expected false alarms per hour (FAH) on this data is <= target_fah.
+
+        Returns a dict with chosen parameters and statistics.
+        """
+        csv_path = csv_path or getattr(self, "_pose_debug_csv", os.path.join(self.save_dir, "pose_debug.csv"))
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Debug CSV not found: {csv_path}")
+
+        rows = []
+        with open(csv_path, "r") as fh:
+            reader = csv.DictReader(fh)
+            for r in reader:
+                try:
+                    ts = float(r.get("ts", 0.0))
+                    pk = r.get("person_key", "unknown")
+                    dist = float(r.get("dist", 0.0))
+                    abs_angle = float(r.get("abs_angle", 0.0)) if r.get("abs_angle") is not None else 0.0
+                    rows.append({"ts": ts, "person_key": pk, "dist": dist, "abs_angle": abs_angle})
+                except Exception:
+                    continue
+
+        if len(rows) == 0:
+            raise ValueError("No usable rows in debug CSV")
+
+        # compute suggested base_radius and angle_base as high-percentiles of observed values
+        dists = np.array([r["dist"] for r in rows], dtype=float)
+        angles = np.array([r["abs_angle"] for r in rows], dtype=float)
+        base_radius_sugg = float(np.percentile(dists, percentile))
+        angle_base_sugg = float(np.percentile(angles, percentile))
+
+        # prepare combined_excess per row for candidate parameters
+        for r in rows:
+            # will compute later per candidate
+            r["dist"] = float(r["dist"])
+            r["abs_angle"] = float(r["abs_angle"])
+
+        # total hours in dataset
+        ts_vals = [r["ts"] for r in rows]
+        total_hours = max(1e-6, (max(ts_vals) - min(ts_vals))) / 3600.0
+
+        # grid for k if not provided
+        if k_grid is None:
+            k_grid = list(np.linspace(0.1, 3.0, 30))
+
+        def simulate_for_k(k_val):
+            # simulate per-person score progression and count alarms
+            alarms = 0
+            rows_by_person = {}
+            for r in rows:
+                rows_by_person.setdefault(r["person_key"], []).append(r)
+
+            for pk, lst in rows_by_person.items():
+                lst_sorted = sorted(lst, key=lambda x: x["ts"])
+                score = 0.0
+                last_ts = lst_sorted[0]["ts"]
+                skip_until = -1.0
+                for rec in lst_sorted:
+                    ts = rec["ts"]
+                    if ts < skip_until:
+                        last_ts = ts
+                        continue
+                    dt = max(0.0, min(0.25, ts - last_ts))
+                    last_ts = ts
+                    # compute new combined_excess with suggested bases
+                    dist_excess = max(0.0, rec["dist"] - base_radius_sugg)
+                    angle_excess = max(0.0, rec["abs_angle"] - angle_base_sugg)
+                    angle_excess_norm = angle_excess / (angle_base_sugg + 1e-6)
+                    if self.pose_combine_mode == "max":
+                        combined = max(dist_excess, float(self.pose_angle_weight) * angle_excess_norm)
+                    else:
+                        combined = dist_excess + float(self.pose_angle_weight) * angle_excess_norm
+
+                    if combined > 0.0:
+                        score = min(1e6, score + k_val * combined * dt)
+                    else:
+                        score = max(0.0, score - decay * dt)
+
+                    if score >= float(self.threshold):
+                        alarms += 1
+                        score = 0.0
+                        skip_until = ts + float(cooldown_s)
+
+            fah = alarms / max(1e-9, total_hours)
+            return fah
+
+        # search best k: maximize sensitivity while fah <= target_fah
+        best_k = None
+        best_fah = None
+        for k_candidate in k_grid:
+            fah = simulate_for_k(k_candidate)
+            if best_k is None:
+                best_k = k_candidate
+                best_fah = fah
+            else:
+                # prefer larger k if still under target_fah
+                if fah <= target_fah and (best_fah is None or best_fah > target_fah or k_candidate > best_k):
+                    best_k = k_candidate
+                    best_fah = fah
+
+        # set tuned parameters
+        prev_params = {"pose_base_radius": self.pose_base_radius,
+                       "pose_angle_base": self.pose_angle_base,
+                       "pose_score_k": self.pose_score_k}
+
+        self.pose_base_radius = base_radius_sugg
+        self.pose_angle_base = angle_base_sugg
+        self.pose_score_k = float(best_k)
+
+        result = {
+            "base_radius_sugg": base_radius_sugg,
+            "angle_base_sugg": angle_base_sugg,
+            "chosen_k": float(best_k),
+            "chosen_fah": float(best_fah),
+            "prev_params": prev_params,
+            "total_hours": total_hours,
+            "rows_used": len(rows),
+        }
+
+        # persist tuning to a small json file for record
+        try:
+            outp = os.path.join(self.save_dir, "auto_tune_result.json")
+            with open(outp, "w") as fh:
+                json.dump(result, fh, indent=2)
+        except Exception:
+            pass
+
+        return result
 
     def process_batch(self, frames, cam_ids):
         if not frames or any(f is None for f in frames):

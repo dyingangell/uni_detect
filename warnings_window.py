@@ -1,9 +1,9 @@
 import json
-import os
 import queue
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import base64
 
@@ -18,6 +18,7 @@ REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 WARNINGS_KEY = "proctor_warnings"
 DECISIONS_KEY = "proctor_decisions"
+LABELS_JSONL = Path("evidence_folder") / "labeled_events.jsonl"
 
 
 @dataclass
@@ -31,9 +32,11 @@ class WarningEvent:
     person_key: str = ""
     status: str = "pending"  # pending|cheating|not_cheating    ffff
     decision_ts: float = 0.0
+    decision: str = ""  # cheating|not_cheating
     box: list[int] | None = None
     evidence_path: str = ""
     evidence_file: str = ""
+    metadata_path: str = ""
 
     @staticmethod
     def from_payload(payload: str) -> "WarningEvent | None":
@@ -54,6 +57,7 @@ class WarningEvent:
             box = obj.get("box")
             evidence_path = str(obj.get("evidence_path") or "")
             evidence_file = str(obj.get("evidence_file") or "")
+            metadata_path = str(obj.get("metadata_path") or "")
             if isinstance(box, list) and len(box) == 4:
                 try:
                     box = [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
@@ -71,9 +75,11 @@ class WarningEvent:
                 real_time=real_time,
                 person_key=person_key,
                 status="pending",
+                decision="",
                 box=box,
                 evidence_path=evidence_path,
                 evidence_file=evidence_file,
+                metadata_path=metadata_path,
             )
         except Exception as e:
             print(f"[WARN_WINDOW] Parsing error: {e}")
@@ -105,6 +111,7 @@ class WarningsApp:
 
         # Avoid re-opening the review window repeatedly on UI refreshes
         self._last_review_key: tuple[str, float] | None = None
+        self._labels_lock = threading.Lock()
 
         # Redis client for sending operator decisions
         self.sender_redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
@@ -129,6 +136,7 @@ class WarningsApp:
 
         ttk.Button(top, text="Clear", command=self._clear).pack(side="right")
         ttk.Button(top, text="Export", command=self._export).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Export labels", command=self._export_labels).pack(side="right", padx=(0, 8))
 
         # main list + scrollbar
         body = ttk.Frame(root, padding=(8, 0, 8, 8))
@@ -139,7 +147,7 @@ class WarningsApp:
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         self.listbox.bind("<Double-Button-1>", lambda _e: self._open_review_for_selected())
         # Single-click UX: click a pending warning -> open review with photo
-        self.listbox.bind("<ButtonRelease-1>", lambda _e: self.root.after(10, self._maybe_open_review_on_click))
+        self.listbox.bind("<ButtonRelease-1>", self._schedule_open_review)
 
         sb = ttk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
         sb.pack(side="right", fill="y")
@@ -155,7 +163,7 @@ class WarningsApp:
         self.reader_thread.start()
 
         # UI polling
-        self.root.after(50, self._drain_ui_queue)
+        self.root.after(50, self._schedule_drain_ui_queue, None)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _redis_reader(self):
@@ -196,7 +204,13 @@ class WarningsApp:
             if self.auto_scroll_var.get():
                 self.listbox.yview_moveto(1.0)
 
-        self.root.after(80, self._drain_ui_queue)
+        self.root.after(80, self._schedule_drain_ui_queue, None)
+
+    def _schedule_drain_ui_queue(self, *_args):
+        self._drain_ui_queue()
+
+    def _schedule_open_review(self, *_args):
+        self.root.after(10, self._maybe_open_review_on_click)
 
     def _filtered_indices(self) -> list[int]:
         f = self.filter_var.get().strip()
@@ -270,10 +284,81 @@ class WarningsApp:
 
         # Update local UI state
         ev.status = "cheating" if decision == "cheating" else "not_cheating"
-        ev.decision_ts = payload["ts"]
+        ev.decision = str(decision)
+        ev.decision_ts = float(payload["ts"])
         self.events[real_idx] = ev
+
+        # Persist label back into the evidence metadata JSON (if available)
+        self._write_label_metadata(ev, decision, float(payload["ts"]))
+
         self._refresh_list()
         self._on_select()
+
+        # append a machine-readable label record for training / later tuning
+        self._append_label_record(ev, decision, float(payload["ts"]))
+
+    def _write_label_metadata(self, ev: WarningEvent, decision: str, decision_ts: float):
+        path = (ev.metadata_path or "").strip()
+        if not path:
+            if ev.evidence_path:
+                path = str(Path(ev.evidence_path).with_suffix(".json"))
+        if not path or not Path(path).is_file():
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        data.update({
+            "operator_decision": str(decision),
+            "operator_decision_ts": float(decision_ts),
+            "label_status": "cheating" if decision == "cheating" else "not_cheating",
+            "ui_status": ev.status,
+            "person_key": ev.person_key,
+            "track_id": ev.track_id,
+            "cam_id": ev.cam_id,
+            "video_time": ev.video_time,
+            "real_time": ev.real_time,
+            "updated_at": float(decision_ts),
+        })
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showwarning("Label save failed", f"Could not update metadata file:\n{path}\n\n{e}")
+
+    def _append_label_record(self, ev: WarningEvent, decision: str, decision_ts: float):
+        LABELS_JSONL.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": ev.ts,
+            "decision_ts": float(decision_ts),
+            "decision": str(decision),
+            "label_status": "cheating" if decision == "cheating" else "not_cheating",
+            "cam_id": ev.cam_id,
+            "track_id": ev.track_id,
+            "person_key": ev.person_key,
+            "video_time": ev.video_time,
+            "real_time": ev.real_time,
+            "box": ev.box,
+            "evidence_path": ev.evidence_path,
+            "evidence_file": ev.evidence_file,
+            "metadata_path": ev.metadata_path,
+        }
+
+        try:
+            line = json.dumps(record, ensure_ascii=False)
+        except Exception:
+            return
+
+        with self._labels_lock:
+            try:
+                with open(LABELS_JSONL, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception as e:
+                messagebox.showwarning("Label append failed", f"Could not append to {LABELS_JSONL}:\n{e}")
 
     def _confirm_selected(self, decision: str):
         picked = self._get_selected_event()
@@ -296,7 +381,7 @@ class WarningsApp:
             return
         self._open_review_window(real_idx, ev)
 
-    def _maybe_open_review_on_click(self):
+    def _maybe_open_review_on_click(self, *_args):
         picked = self._get_selected_event()
         if picked is None:
             return
@@ -334,10 +419,10 @@ class WarningsApp:
 
         path = (ev.evidence_path or "").strip()
         if not path and ev.evidence_file:
-            path = os.path.join("evidence_folder", ev.evidence_file)
+                path = str(Path("evidence_folder") / ev.evidence_file)
 
         photo = None
-        if path and os.path.isfile(path):
+        if path and Path(path).is_file():
             try:
                 img_bgr = cv2.imread(path)
                 if img_bgr is not None and img_bgr.size > 0:
@@ -377,8 +462,8 @@ class WarningsApp:
             except Exception:
                 pass
 
-        ttk.Button(btns, text="✅ Approve (списывает)", command=approve).pack(side="left")
-        ttk.Button(btns, text="❌ No (ложный)", command=reject).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="✅ Approve = cheating", command=approve).pack(side="left")
+        ttk.Button(btns, text="❌ No = false positive", command=reject).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="Close", command=lambda: win.destroy()).pack(side="right")
 
     def _clear(self):
@@ -410,15 +495,41 @@ class WarningsApp:
                         "video_time": ev.video_time,
                         "real_time": ev.real_time,
                         "status": ev.status,
+                        "decision": ev.decision,
                         "decision_ts": ev.decision_ts,
                         "box": ev.box,
                         "evidence_path": ev.evidence_path,
                         "evidence_file": ev.evidence_file,
+                        "metadata_path": ev.metadata_path,
                     }
                     f.write(json.dumps(warning_data, ensure_ascii=False) + "\n")
             messagebox.showinfo("Export", f"Saved {len(self.events)} events to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e))
+
+    def _export_labels(self):
+        path = filedialog.asksaveasfilename(
+            title="Export labels",
+            defaultextension=".jsonl",
+            filetypes=[("JSON Lines", "*.jsonl"), ("Text", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            src = Path(LABELS_JSONL)
+            if not src.is_file():
+                messagebox.showinfo("Export labels", f"No labels file yet:\n{src}")
+                return
+            with open(src, "r", encoding="utf-8") as fsrc, open(path, "w", encoding="utf-8") as fdst:
+                count = 0
+                for line in fsrc:
+                    if not line.strip():
+                        continue
+                    fdst.write(line)
+                    count += 1
+            messagebox.showinfo("Export labels", f"Saved {count} labeled events to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export labels failed", str(e))
 
     def _on_close(self):
         self.stop_evt.set()
